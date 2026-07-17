@@ -46,9 +46,10 @@ for _resource in _NLTK_RESOURCES:
 # Kaggle dataset config
 # ---------------------------------------------------------------------------
 _KAGGLE_DATASET: str = "mohamedabdelwahabali/drugreview"
-_MIN_REAL_ROWS: int = 3000  # require at least this many rows in the raw dataset
-_TRAIN_SIZE: int = 2500
-_TEST_SIZE: int = 500
+_MIN_REAL_ROWS: int = 10000  # require at least this many rows in the raw dataset
+_TRAIN_SIZE: int = 9000
+_TEST_SIZE: int = 1000
+_TARGET_ROWS: int = 10000  # total rows to keep in the raw dataset
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -129,13 +130,13 @@ def _combine_kaggle_csvs(download_dir: Path) -> Path:
 
     combined = pd.concat(parts, ignore_index=True)
 
-    # Randomly sample training + testing rows
-    total_samples = _TRAIN_SIZE + _TEST_SIZE
-    if len(combined) > total_samples:
-        combined = combined.sample(n=total_samples, random_state=42)
-        print(f"[INFO] Randomly sampled {total_samples:,} rows ({_TRAIN_SIZE:,} train + {_TEST_SIZE:,} test)")
+    # Take the first N rows (no random sampling, to keep the pipeline fast and
+    # deterministic). This keeps _TARGET_ROWS total rows for training/inference.
+    if len(combined) > _TARGET_ROWS:
+        combined = combined.head(_TARGET_ROWS)
+        print(f"[INFO] Kept first {_TARGET_ROWS:,} rows (of {len(combined):,} available)")
     else:
-        print(f"[INFO] Using all {len(combined):,} rows (less than requested {total_samples:,})")
+        print(f"[INFO] Using all {len(combined):,} rows (less than requested {_TARGET_ROWS:,})")
 
     # Drop unnecessary columns
     drop_cols = [c for c in ["Unnamed: 0", "review_length"] if c in combined.columns]

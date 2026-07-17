@@ -1,14 +1,22 @@
 """
 PharmaRec - Content-Based Filtering Recommender
 
-This module implements content-based filtering using TF-IDF and Cosine Similarity.
+This module implements content-based filtering using semantic text embeddings
+(sentence-transformers) with a TF-IDF fallback.
 
 Algorithm:
-    - TF-IDF vectorization of drug features (combined_text)
-    - Cosine Similarity for finding similar drugs
+    - Encode each drug's features (condition + review text) into dense
+      semantic vectors via a sentence-transformer model.
+    - Cosine Similarity between embeddings for finding similar drugs.
+
+Using semantic embeddings (instead of bag-of-words TF-IDF) captures meaning:
+e.g. "depression" is close to "anxiety", and "birth control" is close to
+"contraception", which the original TF-IDF pipeline could not express. The
+clean ``condition`` field is prepended to the text so the therapeutic area
+becomes a strong, shared signal.
 
 Input:
-    - Cleaned dataset with combined_text column
+    - Cleaned dataset with combined_text and condition columns
 
 Output:
     - Top N similar drugs based on content
@@ -16,9 +24,12 @@ Output:
 
 from __future__ import annotations
 
+import hashlib
+import pickle
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -26,26 +37,89 @@ from sklearn.metrics.pairwise import cosine_similarity
 if TYPE_CHECKING:
     from typing import Tuple
 
+MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_CACHE = Path(__file__).resolve().parent.parent.parent / "data" / "embeddings_cache.pkl"
+
 
 class ContentRecommender:
-    """Content-based recommender using TF-IDF and Cosine Similarity."""
+    """Content-based recommender using semantic embeddings (TF-IDF fallback)."""
 
-    def __init__(self) -> None:
+    def __init__(self, use_embeddings: bool = True) -> None:
         """Initialize the content-based recommender.
+
+        Args:
+            use_embeddings: If True (default), use a sentence-transformer model.
+                Falls back to tuned TF-IDF if the model cannot be loaded.
 
         Attributes:
             df: DataFrame containing the cleaned dataset.
-            vectorizer: TF-IDF vectorizer fitted on combined_text.
+            embeddings: Dense semantic vectors (numpy array) per drug row.
+            vectorizer: TF-IDF vectorizer (only used in fallback mode).
             similarity_matrix: Cosine similarity matrix between all drugs.
-            drug_indices: Mapping from drug names to DataFrame indices.
+            mode: "embeddings" or "tfidf" depending on what was fitted.
         """
         self.df: pd.DataFrame | None = None
-        self.vectorizer: TfidfVectorizer | None = None
+        self.embeddings: Optional[np.ndarray] = None
+        self.vectorizer: Optional[TfidfVectorizer] = None
         self.similarity_matrix: pd.DataFrame | None = None
-        self.drug_indices: dict[str, int] | None = None
+        self.mode: str = "embeddings"
+        self._use_embeddings = use_embeddings
+        # Case-insensitive lookup: lowercase name -> canonical drugName
+        self._drug_lookup: dict[str, str] = {}
+
+    def _feature_text(self) -> List[str]:
+        """Build the per-row feature text: condition + review text.
+
+        Prepending the condition makes the therapeutic area a dominant,
+        repeated signal so semantically/conditionally related drugs cluster.
+        """
+        assert self.df is not None
+        cond = self.df["condition"].fillna("").astype(str)
+        text = self.df["combined_text"].fillna("").astype(str)
+        return (cond + ". " + cond + ". " + text).tolist()
+
+    def _load_or_build_embeddings(
+        self, texts: List[str], source_path: Optional[Path] = None
+    ) -> Optional[np.ndarray]:
+        """Load cached embeddings or compute (and cache) them.
+
+        The cache is keyed by a hash of the source dataset (path + mtime + row
+        count) so that ANY incoming/new data automatically triggers a rebuild,
+        guaranteeing the content model is always trained on the latest data.
+        """
+        if source_path is not None and Path(source_path).exists():
+            sp = Path(source_path)
+            identity = f"{sp.resolve()}:{sp.stat().st_mtime}:{len(texts)}"
+        else:
+            identity = f"rows:{len(texts)}"
+        key = hashlib.md5(identity.encode("utf-8")).hexdigest()
+        if EMBEDDING_CACHE.exists():
+            try:
+                with open(EMBEDDING_CACHE, "rb") as f:
+                    cache = pickle.load(f)
+                if cache.get("key") == key:
+                    return cache["embeddings"]
+            except Exception:
+                pass
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(MODEL_NAME)
+            emb = model.encode(
+                texts,
+                batch_size=64,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            with open(EMBEDDING_CACHE, "wb") as f:
+                pickle.dump({"key": key, "embeddings": emb}, f)
+            return emb
+        except Exception as e:
+            print(f"[WARNING] Embedding model failed ({e}); falling back to TF-IDF")
+            return None
 
     def fit(self, cleaned_dataset_path: Path | str | None = None) -> None:
-        """Fit the TF-IDF vectorizer and compute similarity matrix.
+        """Fit the content recommender and compute the similarity matrix.
 
         Args:
             cleaned_dataset_path: Path to the cleaned dataset CSV file.
@@ -76,18 +150,51 @@ class ContentRecommender:
         if missing_columns:
             raise ValueError(f"Missing required columns: {missing_columns}")
 
-        # Initialize and fit TF-IDF vectorizer
-        self.vectorizer = TfidfVectorizer()
-        tfidf_matrix = self.vectorizer.fit_transform(self.df["combined_text"])
+        texts = self._feature_text()
 
-        # Compute cosine similarity matrix
+        embeddings = None
+        if self._use_embeddings:
+            embeddings = self._load_or_build_embeddings(texts, cleaned_dataset_path)
+
+        if embeddings is not None:
+            self.mode = "embeddings"
+            self.embeddings = embeddings
+            sim = cosine_similarity(embeddings)
+        else:
+            # Fallback: tuned TF-IDF on the same feature text
+            self.mode = "tfidf"
+            self.vectorizer = TfidfVectorizer(
+                stop_words="english",
+                ngram_range=(1, 2),
+                min_df=3,
+                max_df=0.6,
+            )
+            tfidf_matrix = self.vectorizer.fit_transform(texts)
+            sim = cosine_similarity(tfidf_matrix)
+
         self.similarity_matrix = pd.DataFrame(
-            cosine_similarity(tfidf_matrix),
+            sim,
             index=self.df.index,
             columns=self.df.index,
         )
 
-        print(f"[INFO] ContentRecommender fitted on {len(self.df)} drugs")
+        # Build case-insensitive lookup (lowercase -> canonical drug name)
+        self._drug_lookup = {name.lower(): name for name in self.df["drugName"].unique()}
+
+        print(
+            f"[INFO] ContentRecommender fitted on {len(self.df)} drugs "
+            f"(mode={self.mode})"
+        )
+
+    def _resolve_drug(self, drug_name: str) -> str:
+        """Resolve a (possibly mis-cased) drug name to its canonical form.
+
+        Raises ValueError if no case-insensitive match exists in the dataset.
+        """
+        canonical = self._drug_lookup.get(drug_name.lower())
+        if canonical is None:
+            raise ValueError(f"Drug '{drug_name}' not found in dataset")
+        return canonical
 
     def recommend(self, drug_name: str, top_n: int = 10) -> List[Tuple[str, str, float]]:
         """Recommend top N similar drugs based on content.
@@ -108,8 +215,8 @@ class ContentRecommender:
         if self.df is None or self.similarity_matrix is None:
             raise RuntimeError("Recommender has not been fitted. Call fit() first.")
 
-        if drug_name not in self.df["drugName"].values:
-            raise ValueError(f"Drug '{drug_name}' not found in dataset")
+        # Case-insensitive drug name resolution
+        drug_name = self._resolve_drug(drug_name)
 
         # Get all indices where drugName matches
         drug_indices = self.df[self.df["drugName"] == drug_name].index.tolist()

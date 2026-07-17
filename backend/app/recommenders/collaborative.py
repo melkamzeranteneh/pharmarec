@@ -145,6 +145,8 @@ class CollaborativeRecommender:
         self.drug_mean_ratings = dict(zip(stats["drugName"], stats["mean_rating"]))
         self.drug_weighted_scores = dict(zip(stats["drugName"], stats["weighted_score"]))
         self.drug_map = {drug: idx for idx, drug in enumerate(stats["drugName"])}
+        # Case-insensitive lookup: lowercase name -> canonical drugName
+        self.drug_lookup = {drug.lower(): drug for drug in stats["drugName"]}
 
         # condition -> drugs sorted by weighted score (best first)
         cond_map: dict[str, list[str]] = {}
@@ -197,23 +199,33 @@ class CollaborativeRecommender:
     # ------------------------------------------------------------------
     # Lookups
     # ------------------------------------------------------------------
+    def _resolve_drug(self, drug_name: str) -> str:
+        """Resolve a (possibly mis-cased) drug name to its canonical form.
+
+        Raises ValueError if no case-insensitive match exists in the dataset.
+        """
+        canonical = self.drug_lookup.get(drug_name.lower())
+        if canonical is None:
+            raise ValueError(f"Drug '{drug_name}' not found in dataset")
+        return canonical
+
     def get_drug_mean_rating(self, drug_name: str) -> float:
         """Return the raw mean rating for a drug (0.0 if unknown)."""
         if self.drug_mean_ratings is None:
             return 0.0
-        return float(self.drug_mean_ratings.get(drug_name, 0.0))
+        return float(self.drug_mean_ratings.get(self._resolve_drug(drug_name), 0.0))
 
     def get_weighted_score(self, drug_name: str) -> float:
         """Return the Bayesian-weighted quality score for a drug."""
         if self.drug_weighted_scores is None:
             return 0.0
-        return float(self.drug_weighted_scores.get(drug_name, self.global_mean))
+        return float(self.drug_weighted_scores.get(self._resolve_drug(drug_name), self.global_mean))
 
     def get_condition(self, drug_name: str) -> str | None:
         """Return the primary condition treated by a drug."""
         if self.drug_condition is None:
             return None
-        return self.drug_condition.get(drug_name)
+        return self.drug_condition.get(self._resolve_drug(drug_name))
 
     def predict(self, drug_name: str) -> float:
         """Predict the crowd quality score (weighted mean rating) for a drug.
@@ -249,8 +261,8 @@ class CollaborativeRecommender:
         if self.drug_stats is None or self.condition_drugs is None:
             raise RuntimeError("Model has not been trained. Call train() first.")
 
-        if drug_name not in self.drug_map:
-            raise ValueError(f"Drug '{drug_name}' not found in dataset")
+        # Case-insensitive drug name resolution
+        drug_name = self._resolve_drug(drug_name)
 
         condition = self.get_condition(drug_name)
 
