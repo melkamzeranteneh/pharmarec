@@ -19,7 +19,7 @@ function RecommendationTable({ recommendations, method }: RecommendationTablePro
         return [
           { key: 'rank', header: '#' },
           { key: 'drugName', header: 'Drug Name' },
-          { key: 'predictedRating', header: 'Predicted Rating' }
+          { key: 'predictedRating', header: 'Quality Score' }
         ]
       case 'hybrid':
         return [

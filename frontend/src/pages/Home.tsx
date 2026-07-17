@@ -3,7 +3,7 @@ import axios from 'axios'
 import DrugSearch from '../components/DrugSearch'
 import MethodSelector from '../components/MethodSelector'
 import RecommendationTable from '../components/RecommendationTable'
-import MetricsComparisonTable from '../components/MetricsComparisonTable'
+import AnalysisPanel from '../components/AnalysisPanel'
 
 const API_BASE = '/api'
 
@@ -25,27 +25,19 @@ export interface Recommendation {
   hybridScore?: number
 }
 
-export interface Metrics {
-  hybrid: {
-    precision_at_10: number
-    recall_at_10: number
-    coverage: number
-    execution_time: number
-  }
-  collaborative: {
-    rmse: number
-    mae: number
-  }
-  content: {
-    status: string
-  }
+export interface AnalysisRankRow {
+  method: string
+  precision_at_10: number
+  recall_at_10: number
+  coverage: number
+  execution_time: number
 }
 
-export interface ComparisonRow {
-  metric: string
-  hybrid: number
-  content_based: number
-  collaborative: number
+export interface Analysis {
+  winner: string
+  winner_key: string
+  ranking: AnalysisRankRow[]
+  explanation: string[]
 }
 
 function HomePage() {
@@ -57,10 +49,9 @@ function HomePage() {
   const [isLoadingRecommendations, setIsLoadingRecommendations] = useState(false)
   const [recommendationsError, setRecommendationsError] = useState<string | null>(null)
 
-  const [, setMetrics] = useState<Metrics | null>(null)
-  const [comparisonTable, setComparisonTable] = useState<ComparisonRow[]>([])
-  const [isLoadingMetrics, setIsLoadingMetrics] = useState(false)
-  const [metricsError, setMetricsError] = useState<string | null>(null)
+  const [analysis, setAnalysis] = useState<Analysis | null>(null)
+  const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false)
+  const [analysisError, setAnalysisError] = useState<string | null>(null)
 
   const [selectedMethod, setSelectedMethod] = useState<'content' | 'collaborative' | 'hybrid'>('content')
   const [searchQuery, setSearchQuery] = useState('')
@@ -104,27 +95,27 @@ function HomePage() {
     }
   }, [])
 
-  const fetchMetrics = useCallback(async () => {
-    setIsLoadingMetrics(true)
-    setMetricsError(null)
+  const fetchAnalysis = useCallback(async () => {
+    setIsLoadingAnalysis(true)
+    setAnalysisError(null)
     try {
-      const metricsResponse = await axios.get(`${API_BASE}/metrics`)
-      setMetrics(metricsResponse.data.metrics)
-      const comparisonResponse = await axios.get(`${API_BASE}/metrics/comparison`)
-      if (comparisonResponse.data.comparison_table) {
-        setComparisonTable(comparisonResponse.data.comparison_table)
+      const response = await axios.get(`${API_BASE}/analysis`)
+      if (response.data.status === 'ok') {
+        setAnalysis(response.data)
+      } else {
+        setAnalysisError(response.data.error || 'Failed to load analysis')
       }
     } catch {
-      setMetricsError('Failed to load metrics')
+      setAnalysisError('Failed to load analysis')
     } finally {
-      setIsLoadingMetrics(false)
+      setIsLoadingAnalysis(false)
     }
   }, [])
 
   useEffect(() => {
     fetchDrugs()
-    fetchMetrics()
-  }, [fetchDrugs, fetchMetrics])
+    fetchAnalysis()
+  }, [fetchDrugs, fetchAnalysis])
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
@@ -169,7 +160,7 @@ function HomePage() {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <button onClick={fetchMetrics} className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors" title="Refresh metrics">
+              <button onClick={() => { fetchAnalysis() }} className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors" title="Refresh analysis">
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.992 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
                 </svg>
@@ -191,7 +182,7 @@ function HomePage() {
             </div>
             <div>
               <h2 className="text-sm font-semibold text-gray-900">Find Recommendations</h2>
-              <p className="text-xs text-gray-400">Search for a drug or enter a user ID</p>
+              <p className="text-xs text-gray-400">Search for a drug to get recommendations</p>
             </div>
           </div>
 
@@ -202,8 +193,8 @@ function HomePage() {
                 <DrugSearch
                   value={searchQuery}
                   onChange={(value) => setSearchQuery(value)}
-                  placeholder={selectedMethod === 'collaborative' ? 'Enter user ID (e.g. 100974)' : 'Enter drug name'}
-                  drugNames={selectedMethod !== 'collaborative' ? drugNames : []}
+                  placeholder="Enter drug name"
+                  drugNames={drugNames}
                 />
               </div>
 
@@ -238,34 +229,8 @@ function HomePage() {
             </div>
           </form>
 
-          {/* Collaborative User ID Hint */}
-          {selectedMethod === 'collaborative' && (
-            <div className="mt-4 p-3 rounded-lg bg-red-50 border border-red-100">
-              <div className="flex items-start gap-2">
-                <svg className="h-4 w-4 text-red-500 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                <div>
-                  <p className="text-xs font-medium text-red-700">Try these user IDs:</p>
-                  <div className="flex flex-wrap gap-1.5 mt-1.5">
-                    {['100974', '12636', '200864', '134763', '89889'].map(id => (
-                      <button
-                        key={id}
-                        type="button"
-                        onClick={() => setSearchQuery(id)}
-                        className="px-2 py-0.5 rounded text-xs font-mono bg-white border border-red-200 text-red-700 hover:bg-red-50 transition-colors"
-                      >
-                        {id}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
           {/* Search History */}
-          {searchHistory.length > 0 && selectedMethod !== 'collaborative' && (
+          {searchHistory.length > 0 && (
             <div className="mt-4 pt-4 border-t border-gray-100">
               <div className="flex items-center justify-between mb-2.5">
                 <div className="flex items-center gap-2">
@@ -378,13 +343,13 @@ function HomePage() {
               </svg>
             </div>
             <p className="text-sm font-medium text-gray-500">Search for a drug to get started</p>
-            <p className="text-xs text-gray-400 mt-1">Try searching for a drug name or user ID above</p>
+            <p className="text-xs text-gray-400 mt-1">Try searching for a drug name above</p>
           </div>
         )}
 
         {/* Bottom Section */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Metrics */}
+          {/* Analysis & Conclusion */}
           <div className="lg:col-span-2 bg-white rounded-xl border border-gray-200 shadow-sm">
             <div className="p-5 border-b border-gray-100">
               <div className="flex items-center gap-3">
@@ -394,18 +359,13 @@ function HomePage() {
                   </svg>
                 </div>
                 <div>
-                  <h2 className="text-sm font-semibold text-gray-900">Algorithm Comparison</h2>
-                  <p className="text-xs text-gray-400">Performance metrics across methods</p>
+                  <h2 className="text-sm font-semibold text-gray-900">Analysis &amp; Conclusion</h2>
+                  <p className="text-xs text-gray-400">Which method performs better, and why</p>
                 </div>
               </div>
             </div>
             <div className="p-5">
-              {metricsError && (
-                <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-100">
-                  <p className="text-sm text-red-700">{metricsError}</p>
-                </div>
-              )}
-              <MetricsComparisonTable comparisonData={comparisonTable} isLoading={isLoadingMetrics} />
+              <AnalysisPanel analysis={analysis} isLoading={isLoadingAnalysis} error={analysisError} />
             </div>
           </div>
 

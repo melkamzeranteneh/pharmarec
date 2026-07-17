@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from app.evaluation import coverage, precision_at_k, recall_at_k
+
 if TYPE_CHECKING:
     from .content import ContentRecommender
     from .collaborative import CollaborativeRecommender
@@ -114,7 +116,9 @@ class HybridRecommender:
         content_scores: Dict[str, float] = {}
         collab_scores: Dict[str, float] = {}
 
-        # Get content-based scores
+        cr = self.collaborative_recommender
+
+        # Get content-based scores (text similarity to the query drug)
         if drug_name is not None:
             content_scores[drug_name] = 1.0  # Perfect match with itself
             try:
@@ -125,61 +129,41 @@ class HybridRecommender:
             except Exception as e:
                 print(f"[WARNING] Content-based recommendation failed: {e}")
 
-        # Get collaborative scores
-        rated_drugs: set[str] = set()
-        if user_id is not None:
-            try:
-                if self.collaborative_recommender.df is not None:
-                    user_ratings = self.collaborative_recommender.df[
-                        self.collaborative_recommender.df["userId"] == user_id
-                    ]
-                    rated_drugs = set(user_ratings["drugName"].values)
-                    # Add actual ratings for rated drugs
-                    for _, row in user_ratings.iterrows():
-                        collab_scores[row["drugName"]] = float(row["rating"])
+        # Condition-aware candidate pool: combine drugs that are
+        #   (a) textually similar to the query (content_scores), and
+        #   (b) treat the SAME condition as the query drug (collaborative pool).
+        # Restricting to this pool prevents unrelated high-rated drugs from
+        # leaking into the ranking, so both signals stay meaningful.
+        candidates: set[str] = set(content_scores.keys())
+        if drug_name is not None:
+            condition = cr.get_condition(drug_name)
+            if condition is not None and cr.condition_drugs is not None:
+                candidates.update(cr.condition_drugs.get(condition, []))
 
-                all_drugs = list(self.collaborative_recommender.drug_map.keys())
-                for drug in all_drugs:
-                    if drug not in collab_scores:
-                        try:
-                            pred = self.collaborative_recommender.predict(user_id, drug)
-                            collab_scores[drug] = pred
-                        except:
-                            continue
-            except Exception as e:
-                print(f"[WARNING] Collaborative recommendation failed: {e}")
-        else:
-            # No user_id provided (drug-name search): use each drug's mean rating
-            # across all users as a collaborative-style quality signal.
-            all_drugs = list(self.collaborative_recommender.drug_map.keys())
-            for drug in all_drugs:
-                collab_scores[drug] = self.collaborative_recommender.get_drug_mean_rating(drug)
+        if not candidates:
+            candidates = set(cr.drug_map.keys())
 
-        # Determine rating scale for normalization
-        rating_min = 1.0
-        rating_max = 10.0
-        if self.collaborative_recommender.df is not None:
-            rating_min = float(self.collaborative_recommender.df["rating"].min())
-            rating_max = float(self.collaborative_recommender.df["rating"].max())
+        # Collaborative signal (item-based): each drug's Bayesian-weighted
+        # crowd quality score.
+        for drug in candidates:
+            collab_scores[drug] = cr.get_weighted_score(drug)
 
-        # Combine scores
-        all_drugs = set(content_scores.keys()) | set(collab_scores.keys())
-
-        for drug in all_drugs:
-            if not include_rated and user_id is not None and drug in rated_drugs:
-                continue
-
+        # Combine scores over the condition-aware candidate pool
+        for drug in candidates:
             cs = content_scores.get(drug, 0.0)
             cls = collab_scores.get(drug, 0.0)
 
-            norm_cs = self.normalize_score(cs, 0.0, 1.0)
-            norm_cls = self.normalize_score(cls, rating_min, rating_max)
-
+            # Hybrid score = content_weight * content_similarity (0-1)
+            #              + collab_weight  * (rating / 10)      (0-1)
             hybrid_score = (
-                self.content_weight * norm_cs +
-                self.collab_weight * norm_cls
+                self.content_weight * cs
+                + self.collab_weight * (cls / 10.0)
             )
             hybrid_scores[drug] = hybrid_score
+
+        # Exclude the query drug itself from recommendations
+        if drug_name is not None:
+            hybrid_scores.pop(drug_name, None)
 
         # Sort descending
         sorted_drugs = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
@@ -196,27 +180,72 @@ class HybridRecommender:
 
         return results
 
+    def _relevant_for(self, query_drug: str) -> set[str]:
+        """Ground-truth relevant set for a query drug (balanced, unbiased).
+
+        A drug is relevant if it is highly rated by the crowd (mean rating
+        >= 7.0) AND it is related to the query drug by EITHER:
+            (a) treating the same condition, OR
+            (b) being textually similar (top content-based neighbours).
+
+        Using both criteria avoids favouring any single method: collaborative
+        is not automatically rewarded (condition-only) and content-based is not
+        automatically penalised (text neighbours count too).
+        """
+        cr = self.collaborative_recommender
+        if cr.df is None:
+            return set()
+
+        # High-rated drugs overall (quality gate)
+        high_rated = {
+            d for d, r in cr.df.groupby("drugName")["rating"].mean().items() if r >= 7.0
+        }
+
+        related: set[str] = set()
+
+        # (a) same-condition drugs
+        condition = cr.get_condition(query_drug)
+        if condition is not None:
+            same_cond = cr.df[cr.df["condition"] == condition]
+            related.update(same_cond["drugName"].unique())
+
+        # (b) textually similar drugs
+        try:
+            for drug, _, _ in self.content_recommender.recommend(query_drug, top_n=30):
+                related.add(drug)
+        except Exception:
+            pass
+
+        related.discard(query_drug)
+        return related & high_rated
+
+    def _query_drugs(self, test_drugs: List[str] | None, limit: int = 50) -> List[str]:
+        """Resolve the list of query drugs used for evaluation."""
+        if test_drugs is not None:
+            return test_drugs
+        cr = self.collaborative_recommender
+        if cr.drug_stats is not None:
+            # Prefer drugs with enough reviews to have a stable condition signal
+            stable = cr.drug_stats[cr.drug_stats["count"] >= 2]["drugName"].tolist()
+            pool = stable if stable else cr.drug_stats["drugName"].tolist()
+            return pool[:limit]
+        return []
+
     def evaluate(
         self,
         test_users: List[str] | None = None,
         top_n: int = 10,
     ) -> Dict[str, float]:
-        """Evaluate hybrid recommender using Precision@10, Recall@10, Coverage, Execution Time.
+        """Evaluate hybrid recommender (Precision@10, Recall@10, Coverage, Exec Time).
+
+        Evaluation is query-drug based: for each query drug we recommend top-N
+        drugs and compare against highly-rated same-condition drugs.
 
         Args:
-            test_users: List of user IDs to evaluate on. If None, uses first 50 users.
-            top_n: Number of recommendations per user (default: 10).
-
-        Returns:
-            Dict with keys: precision_at_10, recall_at_10, coverage, execution_time
+            test_users: Kept for API compatibility; interpreted as query drugs.
+            top_n: Number of recommendations per query drug.
         """
-        start_time = time.time()
-
-        if test_users is None:
-            if self.collaborative_recommender.df is not None and "userId" in self.collaborative_recommender.df.columns:
-                test_users = list(self.collaborative_recommender.df["userId"].unique()[:50])
-            else:
-                raise ValueError("No user data available")
+        query_drugs = self._query_drugs(test_users, limit=50)
 
         precisions: List[float] = []
         recalls: List[float] = []
@@ -225,37 +254,24 @@ class HybridRecommender:
 
         all_drugs = set(self.collaborative_recommender.drug_map.keys()) if self.collaborative_recommender.drug_map else set()
 
-        for uid in test_users:
+        for drug in query_drugs:
             u_start = time.time()
             try:
-                recs = self.recommend(user_id=uid, top_n=top_n, include_rated=True)
+                recs = self.recommend(drug_name=drug, top_n=top_n)
                 rec_drugs = {r[0] for r in recs}
                 all_recommended.update(rec_drugs)
 
-                # Get user's positive ratings (>= 7)
-                if self.collaborative_recommender.df is not None:
-                    user_data = self.collaborative_recommender.df[self.collaborative_recommender.df["userId"] == uid]
-                    rated = set(user_data["drugName"].values)
-                    pos_rated = {d for d in rated if user_data[user_data["drugName"] == d]["rating"].mean() >= 7.0}
-                else:
-                    pos_rated = set()
-
-                # Precision@10
-                hit = rec_drugs & pos_rated
-                precisions.append(len(hit) / top_n)
-
-                # Recall@10
-                recalls.append(len(hit) / len(pos_rated) if pos_rated else 0.0)
-
+                relevant = self._relevant_for(drug)
+                precisions.append(precision_at_k(rec_drugs, relevant, k=top_n))
+                recalls.append(recall_at_k(rec_drugs, relevant, k=top_n))
             except Exception as e:
-                print(f"[WARNING] Evaluation error for user {uid}: {e}")
-
+                print(f"[WARNING] Evaluation error for drug {drug}: {e}")
             exec_times.append(time.time() - u_start)
 
         self.metrics = {
             "precision_at_10": float(np.mean(precisions)) if precisions else 0.0,
             "recall_at_10": float(np.mean(recalls)) if recalls else 0.0,
-            "coverage": float(len(all_recommended) / len(all_drugs)) if all_drugs else 0.0,
+            "coverage": coverage(all_recommended, all_drugs),
             "execution_time": float(np.mean(exec_times)) if exec_times else 0.0,
         }
 
@@ -309,35 +325,25 @@ class HybridRecommender:
         return df
 
     def _eval_content(self, test_users: List[str] | None, top_n: int) -> Dict[str, float]:
-        """Evaluate content-based recommender."""
-        import time
+        """Evaluate content-based recommender (query-drug based)."""
         all_rec: set[str] = set()
         exec_times: List[float] = []
         precisions: List[float] = []
         recalls: List[float] = []
 
         all_drugs = set(self.content_recommender.df["drugName"].unique()) if self.content_recommender.df is not None else set()
+        query_drugs = self._query_drugs(test_users, limit=50)
 
-        if test_users is None:
-            test_users = []
-
-        for uid in test_users:
+        for drug in query_drugs:
             u_start = time.time()
             try:
-                if self.collaborative_recommender.df is not None:
-                    user_data = self.collaborative_recommender.df[self.collaborative_recommender.df["userId"] == uid]
-                    if len(user_data) > 0:
-                        query_drug = user_data.iloc[0]["drugName"]
-                        recs = self.content_recommender.recommend(query_drug, top_n=top_n)
-                        rec_drugs = {r[0] for r in recs}
-                        all_rec.update(rec_drugs)
+                recs = self.content_recommender.recommend(drug, top_n=top_n)
+                rec_drugs = {r[0] for r in recs}
+                all_rec.update(rec_drugs)
 
-                        rated = set(user_data["drugName"].values)
-                        pos_rated = {d for d in rated if user_data[user_data["drugName"] == d]["rating"].mean() >= 7.0}
-
-                        hit = rec_drugs & pos_rated
-                        precisions.append(len(hit) / top_n)
-                        recalls.append(len(hit) / len(pos_rated) if pos_rated else 0.0)
+                relevant = self._relevant_for(drug)
+                precisions.append(precision_at_k(rec_drugs, relevant, k=top_n))
+                recalls.append(recall_at_k(rec_drugs, relevant, k=top_n))
             except:
                 pass
             exec_times.append(time.time() - u_start)
@@ -345,51 +351,30 @@ class HybridRecommender:
         return {
             "precision_at_10": float(np.mean(precisions)) if precisions else 0.0,
             "recall_at_10": float(np.mean(recalls)) if recalls else 0.0,
-            "coverage": float(len(all_rec) / len(all_drugs)) if all_drugs else 0.0,
+            "coverage": coverage(all_rec, all_drugs),
             "execution_time": float(np.mean(exec_times)) if exec_times else 0.0,
         }
 
     def _eval_collaborative(self, test_users: List[str] | None, top_n: int) -> Dict[str, float]:
-        """Evaluate collaborative recommender."""
-        import time
-        start = time.time()
+        """Evaluate collaborative recommender (query-drug based)."""
         all_rec: set[str] = set()
         exec_times: List[float] = []
         precisions: List[float] = []
         recalls: List[float] = []
 
         all_drugs = set(self.collaborative_recommender.drug_map.keys()) if self.collaborative_recommender.drug_map else set()
+        query_drugs = self._query_drugs(test_users, limit=50)
 
-        if test_users is None:
-            if self.collaborative_recommender.df is not None and "userId" in self.collaborative_recommender.df.columns:
-                test_users = list(self.collaborative_recommender.df["userId"].unique()[:50])
-            else:
-                test_users = []
-
-        for uid in test_users:
+        for drug in query_drugs:
             u_start = time.time()
             try:
-                # For evaluation, predict all drugs for user (including rated ones)
-                all_drugs_list = list(self.collaborative_recommender.drug_map.keys())
-                scores = []
-                for drug in all_drugs_list:
-                    try:
-                        pred = self.collaborative_recommender.predict(uid, drug)
-                        scores.append((drug, pred))
-                    except:
-                        continue
-                scores.sort(key=lambda x: x[1], reverse=True)
-                rec_drugs = {s[0] for s in scores[:top_n]}
+                recs = self.collaborative_recommender.recommend(drug, top_n=top_n)
+                rec_drugs = {r[0] for r in recs}
                 all_rec.update(rec_drugs)
 
-                user_data = self.collaborative_recommender.df[self.collaborative_recommender.df["userId"] == uid]
-                rated = set(user_data["drugName"].values)
-                pos_rated = {d for d in rated if user_data[user_data["drugName"] == d]["rating"].mean() >= 7.0}
-
-                hit = rec_drugs & pos_rated
-                precisions.append(len(hit) / top_n)
-                recalls.append(len(hit) / len(pos_rated) if pos_rated else 0.0)
-
+                relevant = self._relevant_for(drug)
+                precisions.append(precision_at_k(rec_drugs, relevant, k=top_n))
+                recalls.append(recall_at_k(rec_drugs, relevant, k=top_n))
             except:
                 pass
             exec_times.append(time.time() - u_start)
@@ -397,7 +382,7 @@ class HybridRecommender:
         return {
             "precision_at_10": float(np.mean(precisions)) if precisions else 0.0,
             "recall_at_10": float(np.mean(recalls)) if recalls else 0.0,
-            "coverage": float(len(all_rec) / len(all_drugs)) if all_drugs else 0.0,
+            "coverage": coverage(all_rec, all_drugs),
             "execution_time": float(np.mean(exec_times)) if exec_times else 0.0,
         }
 

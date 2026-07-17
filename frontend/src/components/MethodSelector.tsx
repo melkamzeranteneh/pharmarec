@@ -5,7 +5,7 @@ interface MethodSelectorProps {
 
 const methods = [
   { id: 'content' as const, name: 'Content-Based', description: 'Similar drugs by text analysis' },
-  { id: 'collaborative' as const, name: 'Collaborative', description: 'Based on user ratings' },
+  { id: 'collaborative' as const, name: 'Collaborative', description: 'Top-rated drugs for the same condition' },
   { id: 'hybrid' as const, name: 'Hybrid', description: 'Combined approach' },
 ]
 

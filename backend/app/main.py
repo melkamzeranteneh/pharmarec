@@ -372,11 +372,8 @@ async def get_metrics() -> dict:
     
     metrics = {}
     
-    # Get test users
+    # Query drugs auto-selected by the recommender (dataset has no repeat users)
     test_users = None
-    if _collaborative_recommender is not None and _collaborative_recommender.df is not None:
-        if "userId" in _collaborative_recommender.df.columns:
-            test_users = list(_collaborative_recommender.df["userId"].unique()[:50])
     
     # Hybrid metrics
     try:
@@ -435,25 +432,19 @@ async def get_comparison_table() -> dict:
     
     try:
         if _hybrid_recommender is not None:
-            # Get test users
-            test_users = None
-            if _collaborative_recommender is not None and _collaborative_recommender.df is not None:
-                if "userId" in _collaborative_recommender.df.columns:
-                    test_users = list(_collaborative_recommender.df["userId"].unique()[:50])
-            
             table = _hybrid_recommender.get_comparison_table(
-                test_users=test_users, top_n=10
+                test_users=None, top_n=10
             )
             
-            # Convert to list of dicts
+            # Convert to list of dicts.
+            # table has methods as rows (index) and metrics as columns.
             comparison_data = []
             for metric_name in ["precision_at_10", "recall_at_10", "coverage", "execution_time"]:
                 row = {"metric": metric_name}
-                if metric_name in table.index:
-                    row_data = table.loc[metric_name]
-                    row["hybrid"] = float(row_data.get("Hybrid", 0.0))
-                    row["content_based"] = float(row_data.get("Content-Based", 0.0))
-                    row["collaborative"] = float(row_data.get("Collaborative", 0.0))
+                if metric_name in table.columns:
+                    row["hybrid"] = float(table.loc["Hybrid", metric_name])
+                    row["content_based"] = float(table.loc["Content-Based", metric_name])
+                    row["collaborative"] = float(table.loc["Collaborative", metric_name])
                 else:
                     row["hybrid"] = 0.0
                     row["content_based"] = 0.0
@@ -463,6 +454,127 @@ async def get_comparison_table() -> dict:
             return {"comparison_table": comparison_data, "status": "ok"}
         else:
             return {"error": "Hybrid recommender not initialized", "status": "error"}
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+def _build_analysis(comparison: dict, collab_metrics: dict) -> dict:
+    """Build a data-driven explanation of which method performs best.
+
+    Args:
+        comparison: Mapping of method name -> {precision_at_10, recall_at_10,
+            coverage, execution_time}.
+        collab_metrics: {"rmse": ..., "mae": ...} for collaborative filtering.
+
+    Returns:
+        Dict with the winning method, a ranked summary and human-readable
+        explanation paragraphs.
+    """
+    label_map = {
+        "hybrid": "Hybrid",
+        "content_based": "Content-Based",
+        "collaborative": "Collaborative",
+    }
+
+    # Rank primarily by Precision@10, tie-break by Recall@10.
+    ranked = sorted(
+        comparison.items(),
+        key=lambda kv: (kv[1].get("precision_at_10", 0.0), kv[1].get("recall_at_10", 0.0)),
+        reverse=True,
+    )
+
+    winner_key, winner_metrics = ranked[0]
+    winner_label = label_map.get(winner_key, winner_key)
+
+    explanations: list[str] = []
+    explanations.append(
+        f"Based on the current dataset, the {winner_label} approach performs best, "
+        f"achieving a Precision@10 of {winner_metrics.get('precision_at_10', 0.0):.4f} "
+        f"and Recall@10 of {winner_metrics.get('recall_at_10', 0.0):.4f}."
+    )
+
+    if winner_key == "hybrid":
+        explanations.append(
+            "The Hybrid method wins because it combines the textual similarity signal "
+            "of content-based filtering with the user-behaviour signal of collaborative "
+            "filtering. This lets it recommend drugs that are both semantically related "
+            "to the query and historically well-rated, mitigating the weaknesses of each "
+            "individual approach (cold-start for collaborative, popularity-blindness for content)."
+        )
+    elif winner_key == "content_based":
+        explanations.append(
+            "Content-Based filtering wins here because the drug reviews contain rich "
+            "condition/symptom text, so TF-IDF + cosine similarity captures strong "
+            "semantic relationships even when user-overlap in ratings is sparse."
+        )
+    else:
+        explanations.append(
+            "Collaborative filtering wins here because there is enough overlapping "
+            "user-rating signal for SVD matrix factorisation to learn latent "
+            "preferences that generalise across users."
+        )
+
+    explanations.append(
+        f"Collaborative filtering rating-accuracy: RMSE = {collab_metrics.get('rmse', 0.0):.4f}, "
+        f"MAE = {collab_metrics.get('mae', 0.0):.4f} (lower is better)."
+    )
+
+    ranking = [
+        {
+            "method": label_map.get(k, k),
+            "precision_at_10": v.get("precision_at_10", 0.0),
+            "recall_at_10": v.get("recall_at_10", 0.0),
+            "coverage": v.get("coverage", 0.0),
+            "execution_time": v.get("execution_time", 0.0),
+        }
+        for k, v in ranked
+    ]
+
+    return {
+        "winner": winner_label,
+        "winner_key": winner_key,
+        "ranking": ranking,
+        "explanation": explanations,
+    }
+
+
+@app.get("/analysis", tags=["Evaluation"])
+async def get_analysis() -> dict:
+    """Compare all three methods and explain why one performs better.
+
+    Returns:
+        {
+            "winner": "Hybrid",
+            "ranking": [...],
+            "explanation": ["...", "..."],
+            "status": "ok"
+        }
+    """
+    global _hybrid_recommender, _collaborative_recommender
+
+    if _hybrid_recommender is None:
+        return {"error": "Recommenders not initialized", "status": "error"}
+
+    try:
+        table = _hybrid_recommender.get_comparison_table(test_users=None, top_n=10)
+
+        comparison = {
+            "hybrid": table.loc["Hybrid"].to_dict(),
+            "content_based": table.loc["Content-Based"].to_dict(),
+            "collaborative": table.loc["Collaborative"].to_dict(),
+        }
+
+        collab_metrics = {"rmse": 0.0, "mae": 0.0}
+        if _collaborative_recommender is not None:
+            try:
+                rmse_val, mae_val = _collaborative_recommender.evaluate()
+                collab_metrics = {"rmse": float(rmse_val), "mae": float(mae_val)}
+            except Exception:
+                pass
+
+        analysis = _build_analysis(comparison, collab_metrics)
+        analysis["status"] = "ok"
+        return analysis
     except Exception as e:
         return {"error": str(e), "status": "error"}
 

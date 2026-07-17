@@ -7,7 +7,7 @@ interface DrugSearchProps {
   drugNames?: string[]
 }
 
-function DrugSearch({ value, onChange, placeholder = 'Enter drug name or user ID', drugNames = [] }: DrugSearchProps) {
+function DrugSearch({ value, onChange, placeholder = 'Enter drug name', drugNames = [] }: DrugSearchProps) {
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [filteredSuggestions, setFilteredSuggestions] = useState<string[]>([])
   const containerRef = useRef<HTMLDivElement>(null)

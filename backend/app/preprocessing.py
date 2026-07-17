@@ -46,9 +46,9 @@ for _resource in _NLTK_RESOURCES:
 # Kaggle dataset config
 # ---------------------------------------------------------------------------
 _KAGGLE_DATASET: str = "mohamedabdelwahabali/drugreview"
-_MIN_REAL_ROWS: int = 1000  # synthetic datasets are smaller than this
-_TRAIN_SIZE: int = 1000
-_TEST_SIZE: int = 200
+_MIN_REAL_ROWS: int = 3000  # require at least this many rows in the raw dataset
+_TRAIN_SIZE: int = 2500
+_TEST_SIZE: int = 500
 
 # ---------------------------------------------------------------------------
 # Constants
