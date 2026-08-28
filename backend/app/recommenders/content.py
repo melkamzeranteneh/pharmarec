@@ -121,6 +121,9 @@ class ContentRecommender:
     def fit(self, cleaned_dataset_path: Path | str | None = None) -> None:
         """Fit the content recommender and compute the similarity matrix.
 
+        Tries to load pre-computed embeddings from cache first. If unavailable,
+        falls back to computing embeddings from scratch.
+
         Args:
             cleaned_dataset_path: Path to the cleaned dataset CSV file.
                                  Defaults to backend/data/cleaned_dataset.csv.
@@ -150,10 +153,16 @@ class ContentRecommender:
         if missing_columns:
             raise ValueError(f"Missing required columns: {missing_columns}")
 
-        texts = self._feature_text()
-
+        # Try loading pre-computed embeddings from cache first
         embeddings = None
         if self._use_embeddings:
+            embeddings = self._load_cached_embeddings(cleaned_dataset_path)
+            if embeddings is not None:
+                print("[INFO] Loaded pre-computed embeddings from cache")
+
+        # If no cache, compute from scratch
+        if embeddings is None and self._use_embeddings:
+            texts = self._feature_text()
             embeddings = self._load_or_build_embeddings(texts, cleaned_dataset_path)
 
         if embeddings is not None:
@@ -163,6 +172,7 @@ class ContentRecommender:
         else:
             # Fallback: tuned TF-IDF on the same feature text
             self.mode = "tfidf"
+            texts = self._feature_text()
             self.vectorizer = TfidfVectorizer(
                 stop_words="english",
                 ngram_range=(1, 2),
@@ -185,6 +195,31 @@ class ContentRecommender:
             f"[INFO] ContentRecommender fitted on {len(self.df)} drugs "
             f"(mode={self.mode})"
         )
+
+    def _load_cached_embeddings(self, cleaned_dataset_path: Path) -> Optional[np.ndarray]:
+        """Try to load pre-computed embeddings from the local cache file.
+
+        Returns the embeddings array if the cache is valid, None otherwise.
+        """
+        if not EMBEDDING_CACHE.exists():
+            return None
+        try:
+            with open(EMBEDDING_CACHE, "rb") as f:
+                cache = pickle.load(f)
+            # Validate cache key matches current dataset
+            sp = Path(cleaned_dataset_path)
+            identity = f"{sp.resolve()}:{sp.stat().st_mtime}:{len(self.df)}"
+            expected_key = hashlib.md5(identity.encode("utf-8")).hexdigest()
+            # Also accept the Colab-generated key (row-count based)
+            colab_identity = f"rows:{len(self.df)}"
+            colab_key = hashlib.md5(colab_identity.encode("utf-8")).hexdigest()
+            if cache.get("key") in (expected_key, colab_key):
+                emb = cache["embeddings"]
+                if hasattr(emb, "shape") and emb.shape[0] == len(self.df):
+                    return emb
+        except Exception as e:
+            print(f"[WARNING] Could not load cached embeddings: {e}")
+        return None
 
     def _resolve_drug(self, drug_name: str) -> str:
         """Resolve a (possibly mis-cased) drug name to its canonical form.

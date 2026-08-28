@@ -31,6 +31,7 @@ Evaluation Metrics:
 
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -38,6 +39,8 @@ import pandas as pd
 
 if TYPE_CHECKING:
     pass
+
+COLLAB_STATS_CACHE = Path(__file__).resolve().parent.parent.parent / "data" / "collab_stats.pkl"
 
 
 class CollaborativeRecommender:
@@ -88,6 +91,9 @@ class CollaborativeRecommender:
     ) -> None:
         """Build the item-based collaborative model.
 
+        Tries to load pre-computed stats from cache first. If unavailable,
+        falls back to computing from scratch.
+
         Args:
             cleaned_dataset_path: Path to cleaned dataset CSV.
             test_size: Fraction of ratings held out for RMSE/MAE (via SVD).
@@ -97,6 +103,11 @@ class CollaborativeRecommender:
             FileNotFoundError: If the cleaned dataset is not found.
             ValueError: If required columns are missing.
         """
+        # Try loading from cache first
+        if self._load_from_cache():
+            return
+
+        # Fall back to full training
         if cleaned_dataset_path is None:
             cleaned_dataset_path = (
                 Path(__file__).resolve().parent.parent.parent / "data" / "cleaned_dataset.csv"
@@ -117,9 +128,13 @@ class CollaborativeRecommender:
         if "usefulCount" not in self.df.columns:
             self.df["usefulCount"] = 0
 
+        self._build_stats()
+        self._compute_accuracy(test_size=test_size, random_state=random_state)
+
+    def _build_stats(self) -> None:
+        """Build per-drug aggregate statistics from self.df."""
         self.global_mean = float(self.df["rating"].mean())
 
-        # --- Per-drug aggregate statistics (the collaborative signal) --------
         stats = (
             self.df.groupby("drugName")
             .agg(
@@ -131,8 +146,6 @@ class CollaborativeRecommender:
             .reset_index()
         )
 
-        # Bayesian-weighted rating: shrink low-count drugs toward global mean.
-        # weighted = (v/(v+m)) * R + (m/(v+m)) * C
         m = self.prior_strength
         c = self.global_mean
         stats["weighted_score"] = (
@@ -145,10 +158,8 @@ class CollaborativeRecommender:
         self.drug_mean_ratings = dict(zip(stats["drugName"], stats["mean_rating"]))
         self.drug_weighted_scores = dict(zip(stats["drugName"], stats["weighted_score"]))
         self.drug_map = {drug: idx for idx, drug in enumerate(stats["drugName"])}
-        # Case-insensitive lookup: lowercase name -> canonical drugName
         self.drug_lookup = {drug.lower(): drug for drug in stats["drugName"]}
 
-        # condition -> drugs sorted by weighted score (best first)
         cond_map: dict[str, list[str]] = {}
         for cond, grp in stats.sort_values("weighted_score", ascending=False).groupby("condition"):
             cond_map[cond] = grp["drugName"].tolist()
@@ -159,8 +170,43 @@ class CollaborativeRecommender:
             f"{len(stats)} drugs across {stats['condition'].nunique()} conditions"
         )
 
-        # --- SVD purely to report RMSE / MAE accuracy -----------------------
-        self._compute_accuracy(test_size=test_size, random_state=random_state)
+    def _load_from_cache(self) -> bool:
+        """Try to load pre-computed stats from cache file.
+
+        Returns True if cache loaded successfully, False otherwise.
+        """
+        if not COLLAB_STATS_CACHE.exists():
+            return False
+        try:
+            with open(COLLAB_STATS_CACHE, "rb") as f:
+                cache = pickle.load(f)
+
+            self.drug_condition = cache["drug_condition"]
+            self.drug_mean_ratings = cache["drug_mean_ratings"]
+            self.drug_weighted_scores = cache["drug_weighted_scores"]
+            self.drug_map = cache["drug_map"]
+            self.drug_lookup = cache["drug_lookup"]
+            self.condition_drugs = cache["condition_drugs"]
+            self.global_mean = cache["global_mean"]
+            self.prior_strength = cache.get("prior_strength", 10.0)
+            self.rmse = cache.get("rmse")
+            self.mae = cache.get("mae")
+
+            # Reconstruct drug_stats DataFrame for compatibility
+            self.drug_stats = pd.DataFrame(cache.get("drug_stats_df", []))
+
+            # Load the cleaned dataset for df reference (needed by hybrid evaluator)
+            cleaned_path = Path(__file__).resolve().parent.parent.parent / "data" / "cleaned_dataset.csv"
+            if cleaned_path.exists():
+                self.df = pd.read_csv(cleaned_path)
+
+            n_drugs = cache.get("n_drugs", len(self.drug_map))
+            n_conds = cache.get("n_conditions", len(self.condition_drugs))
+            print(f"[INFO] Loaded pre-computed collab stats ({n_drugs} drugs, {n_conds} conditions)")
+            return True
+        except Exception as e:
+            print(f"[WARNING] Could not load cached collab stats: {e}")
+            return False
 
     def _compute_accuracy(self, test_size: float, random_state: int) -> None:
         """Fit SVD on raw ratings to obtain RMSE/MAE for the metrics table."""

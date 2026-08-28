@@ -13,3 +13,5 @@ services:
         value: "3.12"
       - key: PORT
         value: "10000"
+      - key: HF_REPO
+        sync: false  # Set this in Render dashboard to your HF repo (e.g., username/pharmarec-weights)

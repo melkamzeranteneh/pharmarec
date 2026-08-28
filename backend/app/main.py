@@ -51,25 +51,44 @@ _cleaned_df = None
 
 
 def load_recommenders():
-    """Load and initialize all recommender systems."""
+    """Load and initialize all recommender systems.
+
+    First tries to download pre-computed weights from Hugging Face Hub.
+    Falls back to full training if Hub download fails or weights are unavailable.
+    """
     global _content_recommender, _collaborative_recommender, _hybrid_recommender, _cleaned_df
     
     from app.recommenders.content import ContentRecommender
     from app.recommenders.collaborative import CollaborativeRecommender
     from app.recommenders.hybrid import HybridRecommender
+    from app.utils import ensure_weights
     
     _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
     _CLEANED_DATASET = "cleaned_dataset.csv"
     cleaned_path = _DATA_DIR / _CLEANED_DATASET
     
-    if not cleaned_path.exists():
-        print("[STARTUP] Cleaned dataset not found. Running preprocessing...")
-        run_preprocessing()
+    # Step 1: Try downloading pre-computed weights from HF Hub
+    print("[STARTUP] Checking for pre-computed weights...")
+    hub_ok = ensure_weights(_DATA_DIR)
     
-    # Load cleaned dataset
-    _cleaned_df = pd.read_csv(cleaned_path)
+    # Step 2: If Hub download failed, try preprocessing locally
+    if not hub_ok or not cleaned_path.exists():
+        if not cleaned_path.exists():
+            print("[STARTUP] Cleaned dataset not found. Running preprocessing...")
+            try:
+                run_preprocessing()
+            except Exception as e:
+                print(f"[STARTUP] Preprocessing failed: {e}")
+                print("[STARTUP] Will attempt to continue with whatever is available")
     
-    # Initialize recommenders
+    # Step 3: Load cleaned dataset
+    if cleaned_path.exists():
+        _cleaned_df = pd.read_csv(cleaned_path)
+    else:
+        print("[STARTUP] WARNING: No cleaned dataset available")
+        _cleaned_df = pd.DataFrame()
+    
+    # Step 4: Initialize recommenders (they will use cached weights if available)
     print("[STARTUP] Initializing ContentRecommender...")
     _content_recommender = ContentRecommender()
     _content_recommender.fit()
