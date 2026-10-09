@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
-# PharmaRec - Lean dependencies for Render's FREE tier
+# PharmaRec - Lean dependencies for Render's FREE tier (512 MB RAM)
 #
 # The API serves pre-computed artifacts (committed in backend/data/), so it
-# never needs torch, sentence-transformers, surprise, or kagglehub at runtime.
+# never needs torch, transformers, or sentence-transformers at runtime.
 # This keeps the deploy image small (fast build, fast cold start) and the RAM
 # footprint well under Render's 512 MB free allowance.
 #
@@ -16,5 +16,4 @@ numpy==1.26.4
 scikit-learn==1.5.2
 nltk==3.9.1
 pydantic==2.14.0
-sentence-transformers==5.6.0
 huggingface_hub==0.30.0
