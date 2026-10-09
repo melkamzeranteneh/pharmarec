@@ -15,5 +15,5 @@ pandas==2.2.3
 numpy==1.26.4
 scikit-learn==1.5.2
 nltk==3.9.1
-pydantic<2.5
+pydantic==2.14.0
 huggingface_hub==0.30.0
