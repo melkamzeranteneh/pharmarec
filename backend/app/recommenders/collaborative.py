@@ -60,22 +60,22 @@ class CollaborativeRecommender:
                 drugs with few reviews more strongly.
 
         Attributes:
-            df: Cleaned dataset (one row per review).
             drug_stats: Per-drug aggregate stats (count, mean, weighted score).
             drug_condition: Mapping drug -> primary condition.
             condition_drugs: Mapping condition -> list of drugs (sorted by score).
             drug_map: Mapping drug name -> index (kept for API compatibility).
+            high_rated_drugs: Set of drugs with mean crowd rating >= 7.0.
             global_mean: Global mean rating across the dataset.
-            rmse / mae: SVD rating-prediction accuracy (for comparison metrics).
+            rmse / mae: Rating-prediction accuracy (for comparison metrics).
         """
         self.prior_strength = prior_strength
-        self.df: pd.DataFrame | None = None
         self.drug_stats: pd.DataFrame | None = None
         self.drug_condition: dict[str, str] | None = None
         self.condition_drugs: dict[str, list[str]] | None = None
         self.drug_map: dict[str, int] | None = None
         self.drug_mean_ratings: dict[str, float] | None = None
         self.drug_weighted_scores: dict[str, float] | None = None
+        self.high_rated_drugs: set[str] = set()
         self.global_mean: float = 0.0
         self.rmse: float | None = None
         self.mae: float | None = None
@@ -129,7 +129,19 @@ class CollaborativeRecommender:
             self.df["usefulCount"] = 0
 
         self._build_stats()
-        self._compute_accuracy(test_size=test_size, random_state=random_state)
+
+        # Keep only the raw ratings for the accuracy step, then drop the heavy
+        # DataFrame so the runtime footprint stays small (evaluations no longer
+        # need the raw rows, only the pre-aggregated structures above).
+        ratings_df = self.df if "userId" in self.df.columns else None
+        with_synthetic_user = self.df.copy() if ratings_df is None else None
+        self.df = None
+        self._compute_accuracy(
+            test_size=test_size,
+            random_state=random_state,
+            ratings_df=ratings_df,
+            fallback_df=with_synthetic_user,
+        )
 
     def _build_stats(self) -> None:
         """Build per-drug aggregate statistics from self.df."""
@@ -159,6 +171,7 @@ class CollaborativeRecommender:
         self.drug_weighted_scores = dict(zip(stats["drugName"], stats["weighted_score"]))
         self.drug_map = {drug: idx for idx, drug in enumerate(stats["drugName"])}
         self.drug_lookup = {drug.lower(): drug for drug in stats["drugName"]}
+        self.high_rated_drugs = set(stats.loc[stats["mean_rating"] >= 7.0, "drugName"])
 
         cond_map: dict[str, list[str]] = {}
         for cond, grp in stats.sort_values("weighted_score", ascending=False).groupby("condition"):
@@ -191,14 +204,10 @@ class CollaborativeRecommender:
             self.prior_strength = cache.get("prior_strength", 10.0)
             self.rmse = cache.get("rmse")
             self.mae = cache.get("mae")
+            self.high_rated_drugs = set(cache.get("high_rated_drugs", []))
 
             # Reconstruct drug_stats DataFrame for compatibility
             self.drug_stats = pd.DataFrame(cache.get("drug_stats_df", []))
-
-            # Load the cleaned dataset for df reference (needed by hybrid evaluator)
-            cleaned_path = Path(__file__).resolve().parent.parent.parent / "data" / "cleaned_dataset.csv"
-            if cleaned_path.exists():
-                self.df = pd.read_csv(cleaned_path)
 
             n_drugs = cache.get("n_drugs", len(self.drug_map))
             n_conds = cache.get("n_conditions", len(self.condition_drugs))
@@ -208,15 +217,32 @@ class CollaborativeRecommender:
             print(f"[WARNING] Could not load cached collab stats: {e}")
             return False
 
-    def _compute_accuracy(self, test_size: float, random_state: int) -> None:
-        """Fit SVD on raw ratings to obtain RMSE/MAE for the metrics table."""
+    def _compute_accuracy(
+        self,
+        test_size: float,
+        random_state: int,
+        ratings_df: pd.DataFrame | None = None,
+        fallback_df: pd.DataFrame | None = None,
+    ) -> None:
+        """Fit SVD on raw ratings to obtain RMSE/MAE for the metrics table.
+
+        Args:
+            ratings_df: DataFrame with native ``userId`` column (or None).
+            fallback_df: Copy of the ratings with a synthetic user id. Only
+                used when the real dataset has no ``userId`` column.
+        """
         try:
             from surprise import Dataset, Reader, SVD, accuracy
             from surprise.model_selection import train_test_split
 
-            df = self.df.copy()
+            df = ratings_df if ratings_df is not None else fallback_df
+            if df is None:
+                raise ValueError("No rating frame available for SVD")
+
             if "userId" not in df.columns:
+                df = df.copy()
                 df["userId"] = df.groupby(["drugName", "condition", "review"]).ngroup().astype(str)
+                ratings_df = df
 
             ratings_df = pd.DataFrame(
                 {
@@ -353,7 +379,7 @@ if __name__ == "__main__":
         rec = CollaborativeRecommender()
         rec.train()
 
-        sample_drug = rec.df["drugName"].iloc[0]
+        sample_drug = rec.drug_stats["drugName"].iloc[0]
         cond = rec.get_condition(sample_drug)
         print(f"\nSample drug: {sample_drug}  (condition: {cond})")
 

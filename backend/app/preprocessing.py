@@ -19,28 +19,32 @@ Pipeline Steps:
 
 from __future__ import annotations
 
-import os
-import re
 import string
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-import nltk
 import pandas as pd
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-from nltk.tokenize import word_tokenize
 
 # ---------------------------------------------------------------------------
-# Ensure required NLTK data is available
+# NLTK data (loaded lazily so importing this module never blocks on downloads)
 # ---------------------------------------------------------------------------
 _NLTK_RESOURCES: list[str] = ["punkt", "punkt_tab", "stopwords", "wordnet", "omw-1.4"]
 
-for _resource in _NLTK_RESOURCES:
-    try:
-        nltk.data.find(f"tokenizers/{_resource}" if _resource.startswith("punkt") else f"corpora/{_resource}")
-    except LookupError:
-        nltk.download(_resource, quiet=True)
+
+@lru_cache(maxsize=1)
+def _ensure_nltk():
+    """Download the NLTK corpora/tokenizers needed by the cleaning pipeline."""
+    import nltk
+
+    for _resource in _NLTK_RESOURCES:
+        try:
+            nltk.data.find(
+                f"tokenizers/{_resource}" if _resource.startswith("punkt") else f"corpora/{_resource}"
+            )
+        except LookupError:
+            nltk.download(_resource, quiet=True)
+    return True
 
 # ---------------------------------------------------------------------------
 # Kaggle dataset config
@@ -58,9 +62,23 @@ _DATA_DIR: Path = Path(__file__).resolve().parent.parent / "data"
 _RAW_DATASET: str = "drug_review.csv"
 _CLEANED_DATASET: str = "cleaned_dataset.csv"
 
-_STOP_WORDS: set[str] = set(stopwords.words("english"))
-_LEMMATIZER: WordNetLemmatizer = WordNetLemmatizer()
 _PUNCTUATION: str = string.punctuation
+
+
+def _stop_words() -> set[str]:
+    """English stop-words (ensures NLTK data is available first)."""
+    _ensure_nltk()
+    from nltk.corpus import stopwords
+
+    return set(stopwords.words("english"))
+
+
+def _lemmatizer():
+    """WordNet lemmatizer (ensures NLTK data is available first)."""
+    _ensure_nltk()
+    from nltk.stem import WordNetLemmatizer
+
+    return WordNetLemmatizer()
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +229,19 @@ def remove_punctuation(text: str) -> str:
 
 def remove_stop_words(text: str) -> str:
     """Remove English stop words from tokenized text."""
+    from nltk.tokenize import word_tokenize
+
     tokens: list[str] = word_tokenize(text)
-    filtered: list[str] = [token for token in tokens if token not in _STOP_WORDS]
+    filtered: list[str] = [token for token in tokens if token not in _stop_words()]
     return " ".join(filtered)
 
 
 def lemmatize(text: str) -> str:
     """Lemmatize each token in the text."""
+    from nltk.tokenize import word_tokenize
+
     tokens: list[str] = word_tokenize(text)
-    lemmatized: list[str] = [_LEMMATIZER.lemmatize(token) for token in tokens]
+    lemmatized: list[str] = [_lemmatizer().lemmatize(token) for token in tokens]
     return " ".join(lemmatized)
 
 

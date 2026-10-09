@@ -1,12 +1,27 @@
+# ---------------------------------------------------------------------------
+# PharmaRec - FULL development dependencies
+#
+# Use this locally to encode semantic embeddings, run the test scripts, or
+# rebuild the pre-computed artifacts from scratch.
+#
+#   pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 pandas==2.2.3
 numpy==1.26.4
 scikit-learn==1.5.2
-scikit-surprise==1.1.4
+scipy==1.14.1
 nltk==3.9.1
 pydantic==2.9.2
-kagglehub==0.3.10
-sentence-transformers==5.6.0
-huggingface_hub==0.30.0
 
+# Optional / heavy (only needed to GENERATE artifacts, not to serve them):
+#   sentence-transformers == 3.4.1   -> encodes the semantic embeddings
+#   scikit-surprise == 1.1.4         -> SVD RMSE/MAE used by the metrics table
+#   kagglehub == 0.3.10              -> downloads the raw Kaggle dataset
+#   huggingface_hub == 0.30.0        -> optional pre-computed weights sync
+sentence-transformers==3.4.1
+scikit-surprise==1.1.4
+kagglehub==0.3.10
+huggingface_hub==0.30.0

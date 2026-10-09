@@ -2,21 +2,33 @@
 PharmaRec - FastAPI Application Entry Point
 
 This module defines the FastAPI application and exposes endpoints for
-drug recommendation, preprocessing, and evaluation.
+drug recommendation, evaluation, and preprocessing.
+
+Deployment notes (free tier):
+    - Heavy libraries (sentence-transformers, surprise, kagglehub, nltk) are
+      imported lazily so a fast ``uvicorn`` boot only needs FastAPI + pandas.
+    - Pre-computed artifacts (embeddings cache, collaborative stats) are loaded
+      from ``backend/data/``. If they are present, no model training, no HF
+      downloads and no network access happen at startup.
+    - Evaluation is computed once and memoized: ``/analysis``, ``/metrics`` and
+      ``/metrics/comparison`` share a single on-demand run instead of re-running
+      a 50-query benchmark on every request.
 
 Endpoints:
-    GET  /              - Health check
-    GET  /health        - Detailed health check
-    GET  /drugs        - List drugs from cleaned dataset
-    GET  /drugs/names  - List unique drug names
-    POST /recommend     - Get recommendations (content, collaborative, or hybrid)
-    GET  /metrics       - Get evaluation metrics comparison
-    GET  /metrics/comparison - Get comparison table of all algorithms
-    POST /preprocess    - Trigger preprocessing pipeline
+    GET  /                  - Service info
+    GET  /health            - Detailed health check
+    GET  /drugs             - List drugs from cleaned dataset
+    GET  /drugs/names       - List unique drug names
+    POST /recommend         - Get recommendations (content, collaborative, or hybrid)
+    GET  /metrics           - Get evaluation metrics comparison
+    GET  /metrics/comparison- Get comparison table of all algorithms
+    GET  /analysis          - Winner + ranking + explanation
+    POST /preprocess        - Re-run cleaning pipeline and reload all recommenders
 """
 
 from __future__ import annotations
 
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -25,8 +37,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from app.preprocessing import run_preprocessing
 
 # ---------------------------------------------------------------------------
 # Data models for request/response
@@ -47,63 +57,163 @@ class RecommendRequest(BaseModel):
 _content_recommender = None
 _collaborative_recommender = None
 _hybrid_recommender = None
-_cleaned_df = None
+_cleaned_df: pd.DataFrame | None = None
+
+# Memoized evaluation results (computed once on first request, see _evaluate_once)
+_comparison_cache: dict | None = None
+_eval_lock = threading.Lock()
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_CLEANED_DATASET = "cleaned_dataset.csv"
+_EVALUATION_ARTIFACT = _DATA_DIR / "evaluation_cache.json"
 
 
-def load_recommenders():
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+
+def _cleaned_path() -> Path:
+    return _DATA_DIR / _CLEANED_DATASET
+
+
+def _load_cleaned_df() -> pd.DataFrame:
+    """Load the cleaned dataset (cached in module state)."""
+    global _cleaned_df
+    if _cleaned_df is None:
+        path = _cleaned_path()
+        if not path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Cleaned dataset not found. Run /preprocess first.",
+            )
+        _cleaned_df = pd.read_csv(path)
+    return _cleaned_df
+
+
+def load_recommenders() -> None:
     """Load and initialize all recommender systems.
 
-    First tries to download pre-computed weights from Hugging Face Hub.
-    Falls back to full training if Hub download fails or weights are unavailable.
+    Relies on pre-computed artifacts in ``backend/data/``. If the cleaned
+    dataset is missing it is rebuilt (lazy ``nltk``/``kagglehub`` imports).
+    Content embeddings are read from cache when present; otherwise the
+    content recommender falls back to its tuned TF-IDF model.
     """
-    global _content_recommender, _collaborative_recommender, _hybrid_recommender, _cleaned_df
-    
-    from app.recommenders.content import ContentRecommender
+    global _content_recommender, _collaborative_recommender, _hybrid_recommender
+
     from app.recommenders.collaborative import CollaborativeRecommender
+    from app.recommenders.content import ContentRecommender
     from app.recommenders.hybrid import HybridRecommender
-    from app.utils import ensure_weights
-    
-    _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-    _CLEANED_DATASET = "cleaned_dataset.csv"
-    cleaned_path = _DATA_DIR / _CLEANED_DATASET
-    
-    # Step 1: Try downloading pre-computed weights from HF Hub
-    print("[STARTUP] Checking for pre-computed weights...")
-    hub_ok = ensure_weights(_DATA_DIR)
-    
-    # Step 2: If Hub download failed, try preprocessing locally
-    if not hub_ok or not cleaned_path.exists():
-        if not cleaned_path.exists():
-            print("[STARTUP] Cleaned dataset not found. Running preprocessing...")
-            try:
-                run_preprocessing()
-            except Exception as e:
-                print(f"[STARTUP] Preprocessing failed: {e}")
-                print("[STARTUP] Will attempt to continue with whatever is available")
-    
-    # Step 3: Load cleaned dataset
-    if cleaned_path.exists():
-        _cleaned_df = pd.read_csv(cleaned_path)
-    else:
-        print("[STARTUP] WARNING: No cleaned dataset available")
-        _cleaned_df = pd.DataFrame()
-    
-    # Step 4: Initialize recommenders (they will use cached weights if available)
+
+    cleaned_path = _cleaned_path()
+
+    if not cleaned_path.exists():
+        print("[STARTUP] Cleaned dataset not found. Running preprocessing...")
+        try:
+            from app.preprocessing import run_preprocessing
+
+            run_preprocessing()
+        except Exception as e:
+            print(f"[STARTUP] Preprocessing failed ({e}); continuing with what is available")
+
     print("[STARTUP] Initializing ContentRecommender...")
     _content_recommender = ContentRecommender()
     _content_recommender.fit()
-    
+
     print("[STARTUP] Initializing CollaborativeRecommender...")
     _collaborative_recommender = CollaborativeRecommender()
     _collaborative_recommender.train()
-    
+
     print("[STARTUP] Initializing HybridRecommender...")
-    _hybrid_recommender = HybridRecommender(
-        _content_recommender, 
-        _collaborative_recommender
-    )
-    
+    _hybrid_recommender = HybridRecommender(_content_recommender, _collaborative_recommender)
+
     print("[STARTUP] All recommenders initialized successfully")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation (computed once, then memoized)
+# ---------------------------------------------------------------------------
+
+def _load_evaluation_artifact() -> dict | None:
+    """Load a pre-computed evaluation cache (generated at build/bootstrap time).
+
+    The benchmark over ~50 query drugs is the most CPU-heavy task the API has,
+    so a committed artifact lets every metrics/analysis request be instant and
+    keeps the free-tier CPU budget nearly idle.
+    """
+    if not _EVALUATION_ARTIFACT.exists():
+        return None
+    try:
+        import json
+
+        with open(_EVALUATION_ARTIFACT, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("comparison") and data.get("analysis"):
+            print(f"[INFO] Loaded pre-computed evaluation from {_EVALUATION_ARTIFACT.name}")
+            return data
+    except Exception as e:
+        print(f"[WARNING] Could not load evaluation artifact: {e}")
+    return None
+
+
+def _save_evaluation_artifact(data: dict) -> None:
+    """Persist a computed evaluation so future boots can skip the benchmark."""
+    try:
+        import json
+
+        _EVALUATION_ARTIFACT.parent.mkdir(parents=True, exist_ok=True)
+        with open(_EVALUATION_ARTIFACT, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"[INFO] Saved evaluation artifact to {_EVALUATION_ARTIFACT.name}")
+    except Exception as e:
+        print(f"[WARNING] Could not save evaluation artifact: {e}")
+
+
+def _evaluate_once() -> dict:
+    """Return comparison + collab metrics + analysis, cached in memory.
+
+    Priority: in-memory memo -> pre-computed artifact on disk -> one live
+    benchmark run (which is then persisted for future boots).
+    """
+    global _comparison_cache
+    if _comparison_cache is not None:
+        return _comparison_cache
+
+    with _eval_lock:
+        if _comparison_cache is not None:
+            return _comparison_cache
+
+        if _hybrid_recommender is None:
+            raise HTTPException(status_code=500, detail="Recommenders not initialized")
+
+        artifact = _load_evaluation_artifact()
+        if artifact is not None:
+            _comparison_cache = artifact
+            return artifact
+
+        table = _hybrid_recommender.get_comparison_table(test_users=None, top_n=10)
+
+        comparison = {
+            "hybrid": table.loc["Hybrid"].to_dict(),
+            "content_based": table.loc["Content-Based"].to_dict(),
+            "collaborative": table.loc["Collaborative"].to_dict(),
+        }
+
+        collab_metrics: dict[str, float] = {"rmse": 0.0, "mae": 0.0}
+        if _collaborative_recommender is not None:
+            try:
+                rmse_val, mae_val = _collaborative_recommender.evaluate()
+                collab_metrics = {"rmse": float(rmse_val), "mae": float(mae_val)}
+            except Exception:
+                pass
+
+        result = {
+            "comparison": comparison,
+            "collab_metrics": collab_metrics,
+            "analysis": _build_analysis(comparison, collab_metrics),
+        }
+        _comparison_cache = result
+        _save_evaluation_artifact(result)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +223,8 @@ def load_recommenders():
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifecycle manager."""
-    global _content_recommender, _collaborative_recommender, _hybrid_recommender
-    
-    # Startup
     if _content_recommender is None:
         load_recommenders()
-    
     yield
 
 
@@ -129,7 +235,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app: FastAPI = FastAPI(
     title="PharmaRec API",
     description="Comparative Drug Recommendation System",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -149,7 +255,7 @@ app.add_middleware(
 @app.get("/", tags=["Health"])
 async def root() -> dict:
     """Health check endpoint."""
-    return {"status": "ok", "service": "PharmaRec API", "version": "1.0.0"}
+    return {"status": "ok", "service": "PharmaRec API", "version": "2.0.0"}
 
 
 @app.get("/health", tags=["Health"])
@@ -157,7 +263,7 @@ async def health_check() -> dict:
     """Detailed health check."""
     return {
         "status": "healthy",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "content_recommender": "loaded" if _content_recommender is not None else "not loaded",
         "collaborative_recommender": "loaded" if _collaborative_recommender is not None else "not loaded",
         "hybrid_recommender": "loaded" if _hybrid_recommender is not None else "not loaded",
@@ -167,69 +273,45 @@ async def health_check() -> dict:
 @app.get("/drugs", tags=["Data"])
 async def get_drugs(limit: int = 100, offset: int = 0) -> list[dict]:
     """Retrieve drugs from the cleaned dataset.
-    
+
     Args:
         limit: Maximum number of records to return (default: 100).
         offset: Number of records to skip (default: 0).
-    
+
     Returns:
         List of drug records.
     """
-    global _cleaned_df
-    
-    if _cleaned_df is None:
-        _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-        cleaned_path = _DATA_DIR / "cleaned_dataset.csv"
-        if not cleaned_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Cleaned dataset not found. Run /preprocess first."
-            )
-        _cleaned_df = pd.read_csv(cleaned_path)
-    
-    result_df = _cleaned_df[[
-        "drugName", "condition", "review", "rating", "usefulCount"
-    ]].iloc[offset:offset+limit]
-    
+    df = _load_cleaned_df()
+    result_df = df[["drugName", "condition", "review", "rating", "usefulCount"]].iloc[offset:offset + limit]
     return result_df.to_dict(orient="records")
 
 
 @app.get("/drugs/names", tags=["Data"])
 async def get_drug_names(limit: int = 100) -> list[str]:
     """Retrieve unique drug names.
-    
+
     Args:
         limit: Maximum number of unique drug names to return (default: 100).
-    
+
     Returns:
         List of unique drug names.
     """
-    global _cleaned_df
-    
-    if _cleaned_df is None:
-        _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-        cleaned_path = _DATA_DIR / "cleaned_dataset.csv"
-        if not cleaned_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail="Cleaned dataset not found. Run /preprocess first."
-            )
-        _cleaned_df = pd.read_csv(cleaned_path)
-    
-    unique_drugs = _cleaned_df["drugName"].unique().tolist()
+    df = _load_cleaned_df()
+    unique_drugs = df["drugName"].unique().tolist()
     return unique_drugs[:limit]
 
 
 @app.post("/recommend", tags=["Recommendations"])
 async def recommend(request: RecommendRequest) -> dict:
     """Get drug recommendations using the specified method.
-    
+
     Request body:
     {
         "method": "content" | "collaborative" | "hybrid",
-        "query": "Paracetamol" | "user123"
+        "query": "Paracetamol",
+        "previous_searches": ["DrugA", "DrugB"]
     }
-    
+
     Returns:
         {
             "recommendations": [...],
@@ -238,80 +320,58 @@ async def recommend(request: RecommendRequest) -> dict:
             "status": "success"
         }
     """
-    global _content_recommender, _collaborative_recommender, _hybrid_recommender
-    
     method = request.method.lower()
     query = request.query
     previous_searches = request.previous_searches
-    
+
     try:
         if method == "content":
             if _content_recommender is None:
                 raise HTTPException(status_code=500, detail="Content recommender not initialized")
-            
-            # If we have previous searches, find drugs similar to the combined history
+
+            # If we have previous searches, aggregate content scores across history
             if previous_searches:
-                # Get recommendations for each search in history, combine scores
                 all_scores: dict[str, float] = {}
                 all_conditions: dict[str, str] = {}
-                
-                # Include current query
-                all_queries = [query] + previous_searches
-                
-                for q in all_queries:
+                for q in [query] + previous_searches:
                     try:
-                        recs = _content_recommender.recommend(q, top_n=20)
-                        for drug, condition, score in recs:
+                        for drug, condition, score in _content_recommender.recommend(q, top_n=20):
                             if drug not in all_scores:
                                 all_scores[drug] = 0.0
                                 all_conditions[drug] = condition
                             all_scores[drug] += score
                     except ValueError:
                         continue
-                
-                # Sort by combined score and take top 10
                 sorted_drugs = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)[:10]
                 formatted = [
-                    {
-                        "drugName": drug,
-                        "condition": all_conditions.get(drug, ""),
-                        "similarityScore": float(score),
-                    }
+                    {"drugName": drug, "condition": all_conditions.get(drug, ""), "similarityScore": float(score)}
                     for drug, score in sorted_drugs
                 ]
             else:
-                recommendations = _content_recommender.recommend(query, top_n=10)
                 formatted = [
                     {
                         "drugName": drug,
                         "condition": condition,
                         "similarityScore": float(score),
                     }
-                    for drug, condition, score in recommendations
+                    for drug, condition, score in _content_recommender.recommend(query, top_n=10)
                 ]
-            
+
         elif method == "collaborative":
             if _collaborative_recommender is None:
                 raise HTTPException(status_code=500, detail="Collaborative recommender not initialized")
-            recommendations = _collaborative_recommender.recommend(query, top_n=10)
             formatted = [
-                {
-                    "drugName": drug,
-                    "predictedRating": float(rating),
-                }
-                for drug, rating in recommendations
+                {"drugName": drug, "predictedRating": float(rating)}
+                for drug, rating in _collaborative_recommender.recommend(query, top_n=10)
             ]
-            
+
         elif method == "hybrid":
             if _hybrid_recommender is None:
                 raise HTTPException(status_code=500, detail="Hybrid recommender not initialized")
-            
-            # For hybrid with history, aggregate content scores from all searches
+
             if previous_searches:
                 all_hybrid_scores: dict[str, tuple[float, float, float]] = {}
-                all_queries = [query] + previous_searches
-                
-                for q in all_queries:
+                for q in [query] + previous_searches:
                     try:
                         recs = _hybrid_recommender.recommend(drug_name=q, top_n=20)
                         for drug, content, collab, hybrid in recs:
@@ -325,7 +385,6 @@ async def recommend(request: RecommendRequest) -> dict:
                             )
                     except (ValueError, Exception):
                         continue
-                
                 sorted_drugs = sorted(all_hybrid_scores.items(), key=lambda x: x[1][2], reverse=True)[:10]
                 formatted = [
                     {
@@ -337,11 +396,6 @@ async def recommend(request: RecommendRequest) -> dict:
                     for drug, scores in sorted_drugs
                 ]
             else:
-                recommendations = _hybrid_recommender.recommend(
-                    drug_name=query,
-                    user_id=query,
-                    top_n=10
-                )
                 formatted = [
                     {
                         "drugName": drug,
@@ -349,22 +403,22 @@ async def recommend(request: RecommendRequest) -> dict:
                         "collabScore": float(collab),
                         "hybridScore": float(hybrid),
                     }
-                    for drug, content, collab, hybrid in recommendations
+                    for drug, content, collab, hybrid in _hybrid_recommender.recommend(drug_name=query, top_n=10)
                 ]
-            
+
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid method: {method}. Must be 'content', 'collaborative', or 'hybrid'"
+                detail=f"Invalid method: {method}. Must be 'content', 'collaborative', or 'hybrid'",
             )
-        
+
         return {
             "recommendations": formatted,
             "method": method,
             "query": query,
-            "status": "success"
+            "status": "success",
         }
-        
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
@@ -376,68 +430,53 @@ async def recommend(request: RecommendRequest) -> dict:
 @app.get("/metrics", tags=["Evaluation"])
 async def get_metrics() -> dict:
     """Get evaluation metrics for all recommendation methods.
-    
+
     Returns:
         {
             "metrics": {
-                "hybrid": {"precision_at_10": ..., "recall_at_10": ..., "coverage": ..., "execution_time": ...},
+                "hybrid": {"precision_at_10": ..., "recall_at_10": ..., ...},
                 "collaborative": {"rmse": ..., "mae": ..., ...},
-                "content": {"coverage": ..., ...}
+                "content": {...}
             },
             "status": "ok"
         }
     """
-    global _hybrid_recommender, _collaborative_recommender, _content_recommender
-    
-    metrics = {}
-    
-    # Query drugs auto-selected by the recommender (dataset has no repeat users)
-    test_users = None
-    
-    # Hybrid metrics
     try:
-        if _hybrid_recommender is not None:
-            hybrid_metrics = _hybrid_recommender.evaluate(test_users=test_users, top_n=10)
-            metrics["hybrid"] = {
-                "precision_at_10": hybrid_metrics.get("precision_at_10", 0.0),
-                "recall_at_10": hybrid_metrics.get("recall_at_10", 0.0),
-                "coverage": hybrid_metrics.get("coverage", 0.0),
-                "execution_time": hybrid_metrics.get("execution_time", 0.0),
-            }
-        else:
-            metrics["hybrid"] = {"error": "not initialized"}
+        result = _evaluate_once()
+    except HTTPException:
+        raise
     except Exception as e:
-        metrics["hybrid"] = {"error": str(e)}
-    
-    # Collaborative metrics
-    try:
-        if _collaborative_recommender is not None:
-            rmse, mae = _collaborative_recommender.evaluate()
-            metrics["collaborative"] = {
-                "rmse": float(rmse),
-                "mae": float(mae),
-            }
-        else:
-            metrics["collaborative"] = {"error": "not initialized"}
-    except Exception as e:
-        metrics["collaborative"] = {"error": str(e)}
-    
-    # Content metrics
-    try:
-        if _content_recommender is not None:
-            metrics["content"] = {"status": "loaded"}
-        else:
-            metrics["content"] = {"error": "not initialized"}
-    except Exception as e:
-        metrics["content"] = {"error": str(e)}
-    
+        return {"metrics": {}, "status": "error", "error": str(e)}
+
+    comparison = result["comparison"]
+    collab_metrics = result["collab_metrics"]
+
+    metrics = {
+        "hybrid": {
+            "precision_at_10": float(comparison["hybrid"].get("precision_at_10", 0.0)),
+            "recall_at_10": float(comparison["hybrid"].get("recall_at_10", 0.0)),
+            "coverage": float(comparison["hybrid"].get("coverage", 0.0)),
+            "execution_time": float(comparison["hybrid"].get("execution_time", 0.0)),
+        },
+        "collaborative": {
+            "rmse": float(collab_metrics["rmse"]),
+            "mae": float(collab_metrics["mae"]),
+            "precision_at_10": float(comparison["collaborative"].get("precision_at_10", 0.0)),
+            "recall_at_10": float(comparison["collaborative"].get("recall_at_10", 0.0)),
+        },
+        "content": {
+            "precision_at_10": float(comparison["content_based"].get("precision_at_10", 0.0)),
+            "recall_at_10": float(comparison["content_based"].get("recall_at_10", 0.0)),
+            "coverage": float(comparison["content_based"].get("coverage", 0.0)),
+        },
+    }
     return {"metrics": metrics, "status": "ok"}
 
 
 @app.get("/metrics/comparison", tags=["Evaluation"])
 async def get_comparison_table() -> dict:
     """Get comparison table of all recommendation methods.
-    
+
     Returns:
         {
             "comparison_table": [
@@ -447,34 +486,28 @@ async def get_comparison_table() -> dict:
             "status": "ok"
         }
     """
-    global _hybrid_recommender, _collaborative_recommender
-    
     try:
-        if _hybrid_recommender is not None:
-            table = _hybrid_recommender.get_comparison_table(
-                test_users=None, top_n=10
-            )
-            
-            # Convert to list of dicts.
-            # table has methods as rows (index) and metrics as columns.
-            comparison_data = []
-            for metric_name in ["precision_at_10", "recall_at_10", "coverage", "execution_time"]:
-                row = {"metric": metric_name}
-                if metric_name in table.columns:
-                    row["hybrid"] = float(table.loc["Hybrid", metric_name])
-                    row["content_based"] = float(table.loc["Content-Based", metric_name])
-                    row["collaborative"] = float(table.loc["Collaborative", metric_name])
-                else:
-                    row["hybrid"] = 0.0
-                    row["content_based"] = 0.0
-                    row["collaborative"] = 0.0
-                comparison_data.append(row)
-            
-            return {"comparison_table": comparison_data, "status": "ok"}
-        else:
-            return {"error": "Hybrid recommender not initialized", "status": "error"}
+        result = _evaluate_once()
+        comparison = result["comparison"]
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e), "status": "error"}
+
+    label_map = {
+        "hybrid": "Hybrid",
+        "content_based": "Content-Based",
+        "collaborative": "Collaborative",
+    }
+
+    comparison_data = []
+    for metric_name in ["precision_at_10", "recall_at_10", "coverage", "execution_time"]:
+        row = {"metric": metric_name}
+        for key, label in label_map.items():
+            row[label.lower().replace("-", "_")] = float(comparison.get(key, {}).get(metric_name, 0.0))
+        comparison_data.append(row)
+
+    return {"comparison_table": comparison_data, "status": "ok"}
 
 
 def _build_analysis(comparison: dict, collab_metrics: dict) -> dict:
@@ -569,50 +602,39 @@ async def get_analysis() -> dict:
             "status": "ok"
         }
     """
-    global _hybrid_recommender, _collaborative_recommender
-
-    if _hybrid_recommender is None:
-        return {"error": "Recommenders not initialized", "status": "error"}
-
     try:
-        table = _hybrid_recommender.get_comparison_table(test_users=None, top_n=10)
-
-        comparison = {
-            "hybrid": table.loc["Hybrid"].to_dict(),
-            "content_based": table.loc["Content-Based"].to_dict(),
-            "collaborative": table.loc["Collaborative"].to_dict(),
-        }
-
-        collab_metrics = {"rmse": 0.0, "mae": 0.0}
-        if _collaborative_recommender is not None:
-            try:
-                rmse_val, mae_val = _collaborative_recommender.evaluate()
-                collab_metrics = {"rmse": float(rmse_val), "mae": float(mae_val)}
-            except Exception:
-                pass
-
-        analysis = _build_analysis(comparison, collab_metrics)
-        analysis["status"] = "ok"
-        return analysis
+        result = _evaluate_once()
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e), "status": "error"}
+
+    analysis = dict(result["analysis"])
+    analysis["status"] = "ok"
+    return analysis
 
 
 @app.post("/preprocess", tags=["Data"])
 async def preprocess_data() -> dict:
     """Trigger preprocessing pipeline manually.
-    
+
     Returns:
         {"status": "success", "message": "..."}
     """
-    global _content_recommender, _collaborative_recommender, _hybrid_recommender
-    
+    global _content_recommender, _collaborative_recommender, _hybrid_recommender, _cleaned_df, _comparison_cache
+
     try:
+        from app.preprocessing import run_preprocessing
+
         run_preprocessing()
-        # Reload recommenders
+        _cleaned_df = None
         _content_recommender = None
         _collaborative_recommender = None
         _hybrid_recommender = None
+        _comparison_cache = None
+        # Stale benchmark results no longer match the (rebuilt) data.
+        if _EVALUATION_ARTIFACT.exists():
+            _EVALUATION_ARTIFACT.unlink()
         load_recommenders()
         return {"status": "success", "message": "Preprocessing completed and recommenders reloaded."}
     except Exception as e:

@@ -193,21 +193,15 @@ class HybridRecommender:
         automatically penalised (text neighbours count too).
         """
         cr = self.collaborative_recommender
-        if cr.df is None:
+        if not cr.high_rated_drugs:
             return set()
-
-        # High-rated drugs overall (quality gate)
-        high_rated = {
-            d for d, r in cr.df.groupby("drugName")["rating"].mean().items() if r >= 7.0
-        }
 
         related: set[str] = set()
 
-        # (a) same-condition drugs
+        # (a) same-condition drugs (from the pre-computed condition pool)
         condition = cr.get_condition(query_drug)
-        if condition is not None:
-            same_cond = cr.df[cr.df["condition"] == condition]
-            related.update(same_cond["drugName"].unique())
+        if condition is not None and cr.condition_drugs is not None:
+            related.update(cr.condition_drugs.get(condition, []))
 
         # (b) textually similar drugs
         try:
@@ -217,7 +211,7 @@ class HybridRecommender:
             pass
 
         related.discard(query_drug)
-        return related & high_rated
+        return related & cr.high_rated_drugs
 
     def _query_drugs(self, test_drugs: List[str] | None, limit: int = 50) -> List[str]:
         """Resolve the list of query drugs used for evaluation."""

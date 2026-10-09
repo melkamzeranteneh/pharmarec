@@ -1,17 +1,25 @@
+# ---------------------------------------------------------------------------
+# Render blueprint - PharmaRec backend
+# ---------------------------------------------------------------------------
+# Deploy target: Render FREE web service (512 MB RAM / 0.1 CPU).
+# The service serves pre-computed artifacts committed in backend/data/, so the
+# build stays small and the boot only loads data into memory (no model training
+# or downloads), keeping the footprint safely inside the free tier.
+# ---------------------------------------------------------------------------
 services:
   - type: web
     name: pharmarec-backend
     runtime: python
-    plan: standard   # 2 GB RAM minimum (sentence-transformers needs ~1 GB)
+    plan: free
     region: oregon
     rootDir: backend
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements-render.txt
     startCommand: bash start.sh
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.12"
-      - key: PORT
-        value: "10000"
+      # Optional: only used to sync pre-computed embeddings from HF Hub.
+      # Leave empty if the embeddings cache is already committed in backend/data/.
       - key: HF_REPO
-        sync: false  # Set this in Render dashboard to your HF repo (e.g., username/pharmarec-weights)
+        sync: false

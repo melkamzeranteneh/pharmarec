@@ -17,12 +17,11 @@ venv/
 env/
 
 # ---------------------------------------------------------------------------
-# Generated model artifacts (rebuilt by the pipeline).
-# NOTE: backend/data/*.csv ARE tracked in git so the project is runnable
-# without re-downloading the dataset. Only the embeddings cache is ignored.
+# Generated model artifacts.
+# NOTE: backend/data/*.csv AND the pre-computed artifacts (embeddings_cache.pkl,
+# collab_stats.pkl) ARE tracked in git so Render/Vercel deploys are self-contained
+# and boot in seconds without training models or hitting the network.
 # ---------------------------------------------------------------------------
-/backend/data/embeddings_cache.pkl
-*.pkl
 
 # ---------------------------------------------------------------------------
 # Node / frontend

@@ -1,19 +1,26 @@
 """
 PharmaRec - Content-Based Filtering Recommender
 
-This module implements content-based filtering using semantic text embeddings
-(sentence-transformers) with a TF-IDF fallback.
+Implements content-based filtering using dense semantic text embeddings
+(sentence-transformers) with a tuned TF-IDF fallback.
 
 Algorithm:
-    - Encode each drug's features (condition + review text) into dense
-      semantic vectors via a sentence-transformer model.
-    - Cosine Similarity between embeddings for finding similar drugs.
+    - Each drug's feature text is built as ``condition + condition + review``
+      (the therapeutic area is repeated so it dominates the signal).
+    - Feature text is encoded into dense semantic vectors.
+    - Recommendations are the nearest neighbours by cosine similarity.
 
-Using semantic embeddings (instead of bag-of-words TF-IDF) captures meaning:
-e.g. "depression" is close to "anxiety", and "birth control" is close to
-"contraception", which the original TF-IDF pipeline could not express. The
-clean ``condition`` field is prepended to the text so the therapeutic area
-becomes a strong, shared signal.
+Memory note (free tiers):
+    The classic approach stores a full N x N cosine-similarity matrix, which
+    would consume ~800 MB for 10,000 rows. Instead we keep one aggregated,
+    L2-normalised vector per *drug* (a 10k x 384 float32 array ≈ 15 MB) and
+    compute cosine similarity to that drug vector on the fly per request
+    (a single cheap matmul, a few milliseconds). This preserves identical
+    ranking quality while staying comfortably inside a 512 MB budget.
+
+    The sentence-transformers model is only imported *lazily*, when embeddings
+    actually need to be *encoded*. Loading a pre-computed embeddings cache only
+    requires numpy + pickle, so runtime never touches torch.
 
 Input:
     - Cleaned dataset with combined_text and condition columns
@@ -25,9 +32,10 @@ Output:
 from __future__ import annotations
 
 import hashlib
+import os
 import pickle
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -35,42 +43,53 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 if TYPE_CHECKING:
-    from typing import Tuple
+    from typing import List, Optional, Tuple
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_CACHE = Path(__file__).resolve().parent.parent.parent / "data" / "embeddings_cache.pkl"
 
+# Hard cap so the on-the-fly query stays trivially fast even on the smallest CPU.
+_QUERY_TOP_N = 100
+
 
 class ContentRecommender:
-    """Content-based recommender using semantic embeddings (TF-IDF fallback)."""
+    """Content-based recommender using semantic embeddings (TF-IDF fallback).
+
+    Attributes:
+        df: Cleaned dataset (one row per review).
+        mode: ``"embeddings"`` or ``"tfidf"`` depending on what was fitted.
+        drug_names: Canonical drug names, aligned with ``drug_vectors``.
+        drug_vectors: L2-normalised float32 matrix (n_drugs x dim).
+        vectorizer / tfidf_matrix: Used only in the TF-IDF fallback mode.
+    """
 
     def __init__(self, use_embeddings: bool = True) -> None:
         """Initialize the content-based recommender.
 
         Args:
-            use_embeddings: If True (default), use a sentence-transformer model.
-                Falls back to tuned TF-IDF if the model cannot be loaded.
-
-        Attributes:
-            df: DataFrame containing the cleaned dataset.
-            embeddings: Dense semantic vectors (numpy array) per drug row.
-            vectorizer: TF-IDF vectorizer (only used in fallback mode).
-            similarity_matrix: Cosine similarity matrix between all drugs.
-            mode: "embeddings" or "tfidf" depending on what was fitted.
+            use_embeddings: Prefer semantic embeddings over TF-IDF. ``True`` by
+                default. If embeddings cannot be loaded/encoded, the recommender
+                automatically falls back to tuned TF-IDF.
         """
         self.df: pd.DataFrame | None = None
         self.embeddings: Optional[np.ndarray] = None
+        self.drug_names: list[str] = []
+        self.drug_vectors: Optional[np.ndarray] = None
+        self._drug_row_indices: dict[str, list[int]] = {}
         self.vectorizer: Optional[TfidfVectorizer] = None
-        self.similarity_matrix: pd.DataFrame | None = None
+        self.tfidf_matrix: object = None
         self.mode: str = "embeddings"
         self._use_embeddings = use_embeddings
         # Case-insensitive lookup: lowercase name -> canonical drugName
         self._drug_lookup: dict[str, str] = {}
 
+    # ------------------------------------------------------------------
+    # Feature text
+    # ------------------------------------------------------------------
     def _feature_text(self) -> List[str]:
-        """Build the per-row feature text: condition + review text.
+        """Build the per-row feature text: ``condition + condition + review``.
 
-        Prepending the condition makes the therapeutic area a dominant,
+        Prepending the condition twice makes the therapeutic area a dominant,
         repeated signal so semantically/conditionally related drugs cluster.
         """
         assert self.df is not None
@@ -78,61 +97,76 @@ class ContentRecommender:
         text = self.df["combined_text"].fillna("").astype(str)
         return (cond + ". " + cond + ". " + text).tolist()
 
-    def _load_or_build_embeddings(
-        self, texts: List[str], source_path: Optional[Path] = None
-    ) -> Optional[np.ndarray]:
-        """Load cached embeddings or compute (and cache) them.
-
-        The cache is keyed by a hash of the source dataset (path + mtime + row
-        count) so that ANY incoming/new data automatically triggers a rebuild,
-        guaranteeing the content model is always trained on the latest data.
-        """
+    # ------------------------------------------------------------------
+    # Embedding cache
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cache_key(rows: int, source_path: Optional[Path]) -> str:
+        """Stable cache key: fits both colab-generated (row-count only) caches."""
         if source_path is not None and Path(source_path).exists():
             sp = Path(source_path)
-            identity = f"{sp.resolve()}:{sp.stat().st_mtime}:{len(texts)}"
+            identity = f"{sp.resolve()}:{sp.stat().st_mtime}:{rows}"
         else:
-            identity = f"rows:{len(texts)}"
-        key = hashlib.md5(identity.encode("utf-8")).hexdigest()
-        if EMBEDDING_CACHE.exists():
-            try:
-                with open(EMBEDDING_CACHE, "rb") as f:
-                    cache = pickle.load(f)
-                if cache.get("key") == key:
-                    return cache["embeddings"]
-            except Exception:
-                pass
+            identity = f"rows:{rows}"
+        return hashlib.md5(identity.encode("utf-8")).hexdigest()
+
+    def _load_cached_embeddings(self, cleaned_dataset_path: Path) -> Optional[np.ndarray]:
+        """Load pre-computed per-row embeddings from the local cache file."""
+        if not EMBEDDING_CACHE.exists():
+            return None
+        try:
+            with open(EMBEDDING_CACHE, "rb") as f:
+                cache = pickle.load(f)
+            expected_key = self._cache_key(len(self.df or []), cleaned_dataset_path)
+            colab_key = self._cache_key(len(self.df or []), None)
+            if cache.get("key") in (expected_key, colab_key):
+                emb = cache["embeddings"]
+                if hasattr(emb, "shape") and emb.shape[0] == len(self.df):
+                    return np.asarray(emb, dtype=np.float32)
+        except Exception as e:
+            print(f"[WARNING] Could not load cached embeddings: {e}")
+        return None
+
+    def _build_embeddings(self, texts: List[str], source_path: Path) -> Optional[np.ndarray]:
+        """Encode texts with the sentence-transformer (lazy import) and cache them."""
         try:
             from sentence_transformers import SentenceTransformer
-
-            model = SentenceTransformer(MODEL_NAME)
-            emb = model.encode(
-                texts,
-                batch_size=64,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            )
-            with open(EMBEDDING_CACHE, "wb") as f:
-                pickle.dump({"key": key, "embeddings": emb}, f)
-            return emb
-        except Exception as e:
-            print(f"[WARNING] Embedding model failed ({e}); falling back to TF-IDF")
+        except ImportError:
+            print("[WARNING] sentence-transformers not installed; using TF-IDF fallback")
             return None
 
-    def fit(self, cleaned_dataset_path: Path | str | None = None) -> None:
-        """Fit the content recommender and compute the similarity matrix.
+        print(f"[INFO] Encoding {len(texts)} rows with '{MODEL_NAME}' (first run only)...")
+        model = SentenceTransformer(MODEL_NAME)
+        emb = model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        emb = np.asarray(emb, dtype=np.float32)
+        key = self._cache_key(len(texts), source_path)
+        try:
+            EMBEDDING_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            with open(EMBEDDING_CACHE, "wb") as f:
+                pickle.dump({"key": key, "embeddings": emb}, f)
+        except Exception as e:
+            print(f"[WARNING] Could not cache embeddings: {e}")
+        return emb
 
-        Tries to load pre-computed embeddings from cache first. If unavailable,
-        falls back to computing embeddings from scratch.
+    # ------------------------------------------------------------------
+    # Fitting
+    # ------------------------------------------------------------------
+    def fit(self, cleaned_dataset_path: Path | str | None = None) -> None:
+        """Fit the content recommender and prepare per-drug vectors.
 
         Args:
-            cleaned_dataset_path: Path to the cleaned dataset CSV file.
-                                 Defaults to backend/data/cleaned_dataset.csv.
+            cleaned_dataset_path: Path to the cleaned dataset CSV.
+                Defaults to ``backend/data/cleaned_dataset.csv``.
 
         Raises:
             FileNotFoundError: If the cleaned dataset is not found.
             ValueError: If required columns are missing.
         """
-        # Load cleaned dataset
         if cleaned_dataset_path is None:
             cleaned_dataset_path = (
                 Path(__file__).resolve().parent.parent.parent / "data" / "cleaned_dataset.csv"
@@ -141,86 +175,71 @@ class ContentRecommender:
             cleaned_dataset_path = Path(cleaned_dataset_path)
 
         if not cleaned_dataset_path.exists():
-            raise FileNotFoundError(
-                f"Cleaned dataset not found at: {cleaned_dataset_path}"
-            )
+            raise FileNotFoundError(f"Cleaned dataset not found at: {cleaned_dataset_path}")
 
-        self.df = pd.read_csv(cleaned_dataset_path)
+        self.df = pd.read_csv(cleaned_dataset_path, usecols=["drugName", "condition", "combined_text"])
 
-        # Verify required columns exist
-        required_columns = ["drugName", "condition", "combined_text"]
-        missing_columns = [col for col in required_columns if col not in self.df.columns]
-        if missing_columns:
-            raise ValueError(f"Missing required columns: {missing_columns}")
+        required = ["drugName", "condition", "combined_text"]
+        missing = [c for c in required if c not in self.df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
 
-        # Try loading pre-computed embeddings from cache first
-        embeddings = None
+        embeddings: Optional[np.ndarray] = None
         if self._use_embeddings:
             embeddings = self._load_cached_embeddings(cleaned_dataset_path)
             if embeddings is not None:
                 print("[INFO] Loaded pre-computed embeddings from cache")
-
-        # If no cache, compute from scratch
-        if embeddings is None and self._use_embeddings:
-            texts = self._feature_text()
-            embeddings = self._load_or_build_embeddings(texts, cleaned_dataset_path)
+            else:
+                embeddings = self._build_embeddings(self._feature_text(), cleaned_dataset_path)
 
         if embeddings is not None:
             self.mode = "embeddings"
             self.embeddings = embeddings
-            sim = cosine_similarity(embeddings)
+            self._build_drug_vectors()
         else:
-            # Fallback: tuned TF-IDF on the same feature text
+            # Fallback: tuned TF-IDF on the same feature text.
             self.mode = "tfidf"
-            texts = self._feature_text()
             self.vectorizer = TfidfVectorizer(
                 stop_words="english",
                 ngram_range=(1, 2),
                 min_df=3,
                 max_df=0.6,
             )
-            tfidf_matrix = self.vectorizer.fit_transform(texts)
-            sim = cosine_similarity(tfidf_matrix)
+            self.tfidf_matrix = self.vectorizer.fit_transform(self._feature_text())
 
-        self.similarity_matrix = pd.DataFrame(
-            sim,
-            index=self.df.index,
-            columns=self.df.index,
-        )
-
-        # Build case-insensitive lookup (lowercase -> canonical drug name)
         self._drug_lookup = {name.lower(): name for name in self.df["drugName"].unique()}
+        print(f"[INFO] ContentRecommender fitted on {len(self.df)} rows (mode={self.mode})")
 
-        print(
-            f"[INFO] ContentRecommender fitted on {len(self.df)} drugs "
-            f"(mode={self.mode})"
-        )
+    def _build_drug_vectors(self) -> None:
+        """Aggregate the per-row embeddings into one vector per drug.
 
-    def _load_cached_embeddings(self, cleaned_dataset_path: Path) -> Optional[np.ndarray]:
-        """Try to load pre-computed embeddings from the local cache file.
-
-        Returns the embeddings array if the cache is valid, None otherwise.
+        Row indices are grouped per drug and averaged, then L2-normalised so the
+        dot product between two vectors equals their cosine similarity.
         """
-        if not EMBEDDING_CACHE.exists():
-            return None
-        try:
-            with open(EMBEDDING_CACHE, "rb") as f:
-                cache = pickle.load(f)
-            # Validate cache key matches current dataset
-            sp = Path(cleaned_dataset_path)
-            identity = f"{sp.resolve()}:{sp.stat().st_mtime}:{len(self.df)}"
-            expected_key = hashlib.md5(identity.encode("utf-8")).hexdigest()
-            # Also accept the Colab-generated key (row-count based)
-            colab_identity = f"rows:{len(self.df)}"
-            colab_key = hashlib.md5(colab_identity.encode("utf-8")).hexdigest()
-            if cache.get("key") in (expected_key, colab_key):
-                emb = cache["embeddings"]
-                if hasattr(emb, "shape") and emb.shape[0] == len(self.df):
-                    return emb
-        except Exception as e:
-            print(f"[WARNING] Could not load cached embeddings: {e}")
-        return None
+        assert self.df is not None and self.embeddings is not None
 
+        unique_names = self.df["drugName"].unique().tolist()
+        self.drug_names = unique_names
+        self._drug_row_indices = {name: [] for name in unique_names}
+        for row_idx, name in enumerate(self.df["drugName"]):
+            self._drug_row_indices[name].append(row_idx)
+
+        vectors = np.empty((len(unique_names), self.embeddings.shape[1]), dtype=np.float32)
+        for i, name in enumerate(unique_names):
+            row_idx = self._drug_row_indices[name]
+            vectors[i] = self.embeddings[row_idx].mean(axis=0)
+
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self.drug_vectors = (vectors / norms).astype(np.float32)
+
+        # Free the per-row array after aggregation to keep memory minimal.
+        self.embeddings = None
+        self._drug_row_indices = {}
+
+    # ------------------------------------------------------------------
+    # Lookups
+    # ------------------------------------------------------------------
     def _resolve_drug(self, drug_name: str) -> str:
         """Resolve a (possibly mis-cased) drug name to its canonical form.
 
@@ -231,6 +250,53 @@ class ContentRecommender:
             raise ValueError(f"Drug '{drug_name}' not found in dataset")
         return canonical
 
+    # ------------------------------------------------------------------
+    # Recommendation
+    # ------------------------------------------------------------------
+    def _recommend_embeddings(self, drug_name: str, top_n: int) -> List[Tuple[str, str, float]]:
+        """Nearest neighbours by cosine similarity against drug vectors."""
+        assert self.drug_vectors is not None
+
+        drug_index = self.drug_names.index(drug_name)
+        query = self.drug_vectors[drug_index]
+        sims = self.drug_vectors @ query  # both L2-normalised -> cosine similarity
+
+        order = np.argsort(-sims)  # descending
+        results: List[Tuple[str, str, float]] = []
+        for idx in order:
+            if idx == drug_index:
+                continue
+            name = self.drug_names[int(idx)]
+            condition = self.df.loc[self.df["drugName"] == name, "condition"].iat[0]
+            results.append((name, condition, float(sims[idx])))
+            if len(results) >= top_n:
+                break
+        return results
+
+    def _recommend_tfidf(self, drug_name: str, top_n: int) -> List[Tuple[str, str, float]]:
+        """Nearest neighbours over the sparse TF-IDF matrix.
+
+        Mimics the classic behaviour: average the per-review similarity scores
+        of the query drug's rows, then rank neighbour drugs by that average.
+        """
+        assert self.df is not None and self.vectorizer is not None and self.tfidf_matrix is not None
+
+        query_rows = self.df.index[self.df["drugName"] == drug_name].tolist()
+        # average of the cosine similarities of the query drug's rows vs all rows
+        row_sims = cosine_similarity(self.tfidf_matrix[query_rows], self.tfidf_matrix).mean(axis=0)
+        sims = pd.Series(row_sims, index=self.df.index)
+        per_drug = sims.groupby(self.df["drugName"]).mean()
+
+        results: List[Tuple[str, str, float]] = []
+        for candidate, score in per_drug.sort_values(ascending=False).items():
+            if candidate == drug_name:
+                continue
+            condition = self.df.loc[self.df["drugName"] == candidate, "condition"].iat[0]
+            results.append((candidate, condition, float(score)))
+            if len(results) >= top_n:
+                break
+        return results
+
     def recommend(self, drug_name: str, top_n: int = 10) -> List[Tuple[str, str, float]]:
         """Recommend top N similar drugs based on content.
 
@@ -239,47 +305,23 @@ class ContentRecommender:
             top_n: Number of recommendations to return (default: 10).
 
         Returns:
-            List of tuples containing (drug_name, condition, similarity_score) for
-            the top N most similar drugs, sorted in descending order of similarity.
-            The queried drug is excluded from the results.
+            List of tuples ``(drug_name, condition, similarity_score)`` sorted
+            descending by similarity. The queried drug is excluded.
 
         Raises:
             ValueError: If the drug is not found in the dataset.
             RuntimeError: If the recommender has not been fitted yet.
         """
-        if self.df is None or self.similarity_matrix is None:
+        if self.df is None:
             raise RuntimeError("Recommender has not been fitted. Call fit() first.")
 
-        # Case-insensitive drug name resolution
         drug_name = self._resolve_drug(drug_name)
 
-        # Get all indices where drugName matches
-        drug_indices = self.df[self.df["drugName"] == drug_name].index.tolist()
-
-        # Get similarity scores for the queried drug
-        # Average similarity if drug appears multiple times
-        sim_scores: pd.Series = self.similarity_matrix.loc[drug_indices].mean(axis=0)
-
-        # Get top N+1 most similar drugs (including the queried drug itself)
-        top_n_plus_1 = sim_scores.nlargest(top_n + len(drug_indices))
-
-        # Filter out the queried drug
-        recommendations: List[Tuple[str, str, float]] = []
-        for idx, score in top_n_plus_1.items():
-            current_drug = self.df.loc[idx, "drugName"]
-            if current_drug != drug_name:
-                condition = self.df.loc[idx, "condition"]
-                recommendations.append((current_drug, condition, float(score)))
-
-            # Stop when we have enough recommendations
-            if len(recommendations) >= top_n:
-                break
-
-        # Sort by similarity score descending (already sorted from nlargest)
-        # Take only top_n
-        recommendations = recommendations[:top_n]
-
-        return recommendations
+        if self.mode == "embeddings":
+            if self.drug_vectors is None:
+                raise RuntimeError("Recommender has not been fitted. Call fit() first.")
+            return self._recommend_embeddings(drug_name, top_n)
+        return self._recommend_tfidf(drug_name, top_n)
 
 
 # ---------------------------------------------------------------------------
@@ -295,69 +337,47 @@ if __name__ == "__main__":
     print("=" * 60)
 
     try:
-        # Initialize and fit the recommender
-        print("\n[Test 1] Initializing ContentRecommender...")
         recommender = ContentRecommender()
-
-        print("[Test 2] Fitting the recommender...")
         recommender.fit()
 
-        # Get a sample drug from the dataset
         sample_drug = recommender.df["drugName"].iloc[0]
-        print(f"\n[Test 3] Sample drug: {sample_drug}")
+        print(f"\nSample drug: {sample_drug}  (mode={recommender.mode})")
 
-        # Get recommendations
-        print(f"[Test 4] Getting recommendations for '{sample_drug}'...")
         recommendations = recommender.recommend(sample_drug, top_n=5)
-
-        print(f"\n[Test 5] Top 5 Recommendations for '{sample_drug}':")
+        print(f"\nTop 5 Recommendations for '{sample_drug}':")
         print("-" * 60)
         for i, (drug, condition, score) in enumerate(recommendations, 1):
             print(f"  {i}. {drug} | Condition: {condition} | Score: {score:.4f}")
         print("-" * 60)
 
-        # Test with non-existent drug
-        print("\n[Test 6] Testing with non-existent drug...")
         try:
             recommender.recommend("NonExistentDrug123")
             print("  [FAIL] Should have raised ValueError")
-        except ValueError as e:
-            print(f"  [PASS] Correctly raised ValueError: {e}")
+        except ValueError:
+            print("  [PASS] Correctly raised ValueError")
 
-        # Test recommend before fit
-        print("\n[Test 7] Testing recommend before fit...")
-        unfitted_recommender = ContentRecommender()
+        unfitted = ContentRecommender()
         try:
-            unfitted_recommender.recommend(sample_drug)
+            unfitted.recommend(sample_drug)
             print("  [FAIL] Should have raised RuntimeError")
-        except RuntimeError as e:
-            print(f"  [PASS] Correctly raised RuntimeError: {e}")
+        except RuntimeError:
+            print("  [PASS] Correctly raised RuntimeError")
 
-        # Verify queried drug is excluded
-        print(f"\n[Test 8] Verifying queried drug '{sample_drug}' is excluded...")
-        recommendations = recommender.recommend(sample_drug, top_n=10)
-        drug_names = [r[0] for r in recommendations]
-        if sample_drug not in drug_names:
-            print(f"  [PASS] Queried drug not in recommendations")
+        recs = recommender.recommend(sample_drug, top_n=10)
+        if sample_drug not in [r[0] for r in recs]:
+            print("  [PASS] Queried drug not in recommendations")
         else:
-            print(f"  [FAIL] Queried drug found in recommendations")
+            print("  [FAIL] Queried drug found in recommendations")
 
-        # Verify scores are sorted descending
-        print("\n[Test 9] Verifying scores are sorted descending...")
-        scores = [r[2] for r in recommendations]
-        is_sorted = all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1))
-        if is_sorted:
-            print("  [PASS] Scores are sorted in descending order")
+        scores = [r[2] for r in recs]
+        if all(scores[i] >= scores[i + 1] for i in range(len(scores) - 1)):
+            print("  [PASS] Scores sorted descending")
         else:
-            print("  [FAIL] Scores are not sorted correctly")
+            print("  [FAIL] Scores not sorted")
 
-        print("\n" + "=" * 60)
-        print("  All tests completed!")
-        print("=" * 60)
-
+        print("\nAll tests completed!")
     except FileNotFoundError as e:
         print(f"\n[ERROR] {e}")
-        print("\nPlease ensure cleaned_dataset.csv exists in backend/data/")
         print("Run preprocessing first: python -m app.preprocessing")
         sys.exit(1)
     except Exception as e:

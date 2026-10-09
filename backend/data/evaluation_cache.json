@@ -1,0 +1,58 @@
+{
+  "comparison": {
+    "hybrid": {
+      "precision_at_10": 0.802,
+      "recall_at_10": 0.38461353141258425,
+      "coverage": 0.2159090909090909,
+      "execution_time": 2.754396147727966
+    },
+    "content_based": {
+      "precision_at_10": 0.704,
+      "recall_at_10": 0.324868005236488,
+      "coverage": 0.2450284090909091,
+      "execution_time": 1.2676070785522462
+    },
+    "collaborative": {
+      "precision_at_10": 0.638,
+      "recall_at_10": 0.2883917998268401,
+      "coverage": 0.1690340909090909,
+      "execution_time": 0.8208772754669189
+    }
+  },
+  "collab_metrics": {
+    "rmse": 3.139414915169626,
+    "mae": 2.6623520247673103
+  },
+  "analysis": {
+    "winner": "Hybrid",
+    "winner_key": "hybrid",
+    "ranking": [
+      {
+        "method": "Hybrid",
+        "precision_at_10": 0.802,
+        "recall_at_10": 0.38461353141258425,
+        "coverage": 0.2159090909090909,
+        "execution_time": 2.754396147727966
+      },
+      {
+        "method": "Content-Based",
+        "precision_at_10": 0.704,
+        "recall_at_10": 0.324868005236488,
+        "coverage": 0.2450284090909091,
+        "execution_time": 1.2676070785522462
+      },
+      {
+        "method": "Collaborative",
+        "precision_at_10": 0.638,
+        "recall_at_10": 0.2883917998268401,
+        "coverage": 0.1690340909090909,
+        "execution_time": 0.8208772754669189
+      }
+    ],
+    "explanation": [
+      "Based on the current dataset, the Hybrid approach performs best, achieving a Precision@10 of 0.8020 and Recall@10 of 0.3846.",
+      "The Hybrid method wins because it combines the textual similarity signal of content-based filtering with the user-behaviour signal of collaborative filtering. This lets it recommend drugs that are both semantically related to the query and historically well-rated, mitigating the weaknesses of each individual approach (cold-start for collaborative, popularity-blindness for content).",
+      "Collaborative filtering rating-accuracy: RMSE = 3.1394, MAE = 2.6624 (lower is better)."
+    ]
+  }
+}
