@@ -31,6 +31,9 @@ from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
 
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Ensure required NLTK data is available
 # ---------------------------------------------------------------------------
@@ -61,6 +64,13 @@ _CLEANED_DATASET: str = "cleaned_dataset.csv"
 _STOP_WORDS: set[str] = set(stopwords.words("english"))
 _LEMMATIZER: WordNetLemmatizer = WordNetLemmatizer()
 _PUNCTUATION: str = string.punctuation
+
+# ---------------------------------------------------------------------------
+# BERT / SentenceTransformer configuration
+# ---------------------------------------------------------------------------
+_EMBEDDING_MODEL_NAME: str = 'all-MiniLM-L6-v2'
+_EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 output dimension
+_cached_embeddings_path: str = 'backend/data/embeddings.npy'
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +250,70 @@ def clean_review(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# BERT / SentenceTransformer embeddings
+# ---------------------------------------------------------------------------
+
+_cached_bert_model = None
+
+
+def _get_bert_model() -> SentenceTransformer:
+    """Load or cache the SentenceTransformer model (cached at module level)."""
+    global _cached_bert_model
+    if _cached_bert_model is None:
+        print(f"[INFO] Loading BERT model: {_EMBEDDING_MODEL_NAME} (once, cached)")
+        _cached_bert_model = SentenceTransformer(_EMBEDDING_MODEL_NAME, device='cpu')
+    return _cached_bert_model
+
+
+def generate_embeddings(df: pd.DataFrame, output_path: str = None) -> np.ndarray:
+    """Generate BERT embeddings for all combined_text entries in a DataFrame.
+
+    Args:
+        df: DataFrame with 'combined_text' column
+        output_path: If provided, saves embeddings to npy file at this path
+
+    Returns:
+        numpy array of shape (n_rows, EMBEDDING_DIM) containing embeddings
+    """
+    model = _get_bert_model()
+    texts = df['combined_text'].tolist()
+    print(f"[INFO] Generating embeddings for {len(texts):,} reviews (batch_size=32)")
+    embeddings = model.encode(
+        texts, batch_size=32, show_progress_bar=True, convert_to_numpy=True
+    )
+    if output_path:
+        np.save(output_path, embeddings)
+        print(f"[INFO] Saved embeddings to {output_path}: shape={embeddings.shape}")
+    return embeddings
+
+
+def load_cached_embeddings(path: str = None) -> Optional[np.ndarray]:
+    """Load pre-computed embeddings from npy file if it exists.
+
+    Args:
+        path: Path to .npy file. Defaults to cached_embeddings_path.
+
+    Returns:
+        numpy array of shape (n_rows, EMBEDDING_DIM) or None if not found
+    """
+    import os
+    p = path or _cached_embeddings_path
+    if os.path.exists(p):
+        emb = np.load(p)
+        print(f"[INFO] Loaded cached embeddings from {p}: shape={emb.shape}")
+        return emb
+    print(f"[INFO] No cached embeddings found at {p}")
+    return None
+
+
+def get_query_embedding(query: str) -> np.ndarray:
+    """Generate a BERT embedding for a single query string."""
+    model = _get_bert_model()
+    emb = model.encode([query], convert_to_numpy=True)
+    return emb
+
+
+# ---------------------------------------------------------------------------
 # Dataset operations
 # ---------------------------------------------------------------------------
 
@@ -391,6 +465,13 @@ def run_preprocessing(
     print("\n[Step 8/8] Creating combined_text column...")
     df = create_combined_text(df)
 
+    # Limit rows for Render free tier compatibility (2000 rows default)
+    # Can be overridden via DATA_ROW_LIMIT env var
+    import os
+    row_limit = int(os.getenv('DATA_ROW_LIMIT', '2000'))
+    df = df.head(row_limit)
+    print(f"[INFO] Limited dataset to {row_limit} rows (was {df.shape[0] + row_limit}:{row_limit})")
+
     # 9. Save cleaned dataset
     if output_path is None:
         output_path = _DATA_DIR / _CLEANED_DATASET
@@ -401,6 +482,13 @@ def run_preprocessing(
     df.to_csv(output_path, index=False)
     print(f"\n[SAVED] Cleaned dataset saved to: {output_path}")
     print(f"[DONE] Final dataset shape: {df.shape[0]:,} rows x {df.shape[1]} columns")
+
+    # Optional: Generate and save BERT embeddings for the limited dataset
+    if os.getenv('GENERATE_EMBEDDINGS', '0') == '1':
+        print("\n[Step 9/9] Generating BERT embeddings...")
+        embeddings = generate_embeddings(df, output_path=str(_cached_embeddings_path))
+        print(f"[DONE] Embeddings generated: {embeddings.shape}")
+
     print("=" * 60)
 
     return df
