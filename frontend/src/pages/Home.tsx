@@ -5,8 +5,6 @@ import MethodSelector from '../components/MethodSelector'
 import RecommendationTable from '../components/RecommendationTable'
 import AnalysisPanel from '../components/AnalysisPanel'
 
-const API_BASE = '/api'
-
 export interface Drug {
   drugName: string
   condition?: string
@@ -40,7 +38,7 @@ export interface Analysis {
   explanation: string[]
 }
 
-function HomePage() {
+const API_BASE = '/api'
   const [drugs, setDrugs] = useState<Drug[]>([])
   const [isLoadingDrugs, setIsLoadingDrugs] = useState(false)
   const [drugsError, setDrugsError] = useState<string | null>(null)
@@ -56,6 +54,19 @@ function HomePage() {
   const [selectedMethod, setSelectedMethod] = useState<'content' | 'collaborative' | 'hybrid'>('content')
   const [searchQuery, setSearchQuery] = useState('')
   const [searchHistory, setSearchHistory] = useState<string[]>([])
+
+  // Initialize from localStorage
+  useEffect(() => {
+    const stored = localStorage.getItem('pharmarecHistory')
+    setSearchHistory(stored ? JSON.parse(stored) : [])
+  }, [])
+
+  // Save to localStorage on change
+  useEffect(() => {
+    localStorage.setItem('pharmarecHistory', JSON.stringify(searchHistory))
+  }, [searchHistory])
+
+  // ... rest of the component remains the same, but with these modifications:
 
   const fetchDrugs = useCallback(async (limit: number = 50) => {
     setIsLoadingDrugs(true)

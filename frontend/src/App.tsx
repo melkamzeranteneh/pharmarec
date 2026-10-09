@@ -5,15 +5,19 @@ import HomePage from './pages/Home'
 const API_BASE = '/api'
 
 function App() {
-  const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [state, setState] = useState<'initializing' | 'loading' | 'ready' | 'error'>('initializing')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [retryCount, setRetryCount] = useState(0)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const initializedRef = useRef<boolean>(false)
 
   useEffect(() => {
     let cancelled = false
 
     const checkHealth = async () => {
+      if (initializedRef.current) return
+      initializedRef.current = true
+
       try {
         const response = await axios.get(`${API_BASE}/health`, { timeout: 8000 })
         if (cancelled) return
@@ -53,8 +57,8 @@ function App() {
       <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
         <div className="w-full max-w-md">
           <div className="card p-8 text-center">
-            <div className="mx-auto h-14 w-14 rounded-2xl bg-brand-50 flex items-center justify-center mb-6">
-              <svg className="h-7 w-7 text-brand-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <div className="mx-auto h-14 w-14 rounded-2xl bg-red-50 flex items-center justify-center mb-6">
+              <svg className="h-7 w-7 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
               </svg>
             </div>
@@ -75,7 +79,7 @@ function App() {
               </div>
             </div>
             <button
-              onClick={() => { setState('loading'); setRetryCount(0) }}
+              onClick={() => { setState('initializing'); setRetryCount(0); initializedRef.current = false }}
               className="btn-primary w-full"
             >
               Try Again
